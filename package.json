@@ -1,0 +1,12 @@
+{
+  "name": "dca-engine-v23",
+  "version": "2.3.0",
+  "description": "Bitcoin DCA Engine v2.3 — PWA with on-chain proxy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}

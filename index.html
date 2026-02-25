@@ -99,26 +99,71 @@ function saveState(data) {
 }
 
 // ── API ──
-// CORS proxies to try (Bitbo API has no CORS headers)
-const CORS_PROXIES = [
-  (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
-  (u) => "https://corsproxy.io/?" + encodeURIComponent(u),
-  (u) => u, // direct (in case Bitbo adds CORS later)
-];
+// On-chain data source priority:
+//   1. User's Google Apps Script proxy (if configured)
+//   2. Local proxy (server.js)
+//   3. CoinMetrics community API (free, CORS-enabled, partial coverage)
+//   4. CORS proxy wrappers for Bitbo
+//   5. Manual entry
 
 const BITBO_BASE = "https://charts.bitbo.io/api/v1";
 const parseBitbo = (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null;
 
-const API_SOURCES = {
-  price: [
-    { name: "CoinGecko", url: "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", parse: (d) => d?.bitcoin?.usd },
-    { name: "Blockchain.info", url: "https://blockchain.info/ticker", parse: (d) => d?.USD?.last },
-  ],
-  mvrv: CORS_PROXIES.map(proxy => ({ name: "Bitbo", url: proxy(BITBO_BASE + "/mvrv-z/?latest=true"), parse: parseBitbo })),
-  puell: CORS_PROXIES.map(proxy => ({ name: "Bitbo", url: proxy(BITBO_BASE + "/puell-multiple/?latest=true"), parse: parseBitbo })),
-  supplyProfit: CORS_PROXIES.map(proxy => ({ name: "Bitbo", url: proxy(BITBO_BASE + "/supply-in-profit/?latest=true"), parse: parseBitbo })),
-  nupl: CORS_PROXIES.map(proxy => ({ name: "Bitbo", url: proxy(BITBO_BASE + "/nupl/?latest=true"), parse: parseBitbo })),
-};
+// CoinMetrics community API — free, no key, CORS-enabled
+const CM_BASE = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics";
+function cmUrl(metrics) {
+  return CM_BASE + "?assets=btc&metrics=" + metrics + "&frequency=1d&limit_per_metric=1&sort=desc";
+}
+
+function buildOCSources(metric, bitboPath, cmMetric, cmParse, proxyUrl) {
+  const sources = [];
+  // 1. User's Google Apps Script proxy (highest priority)
+  if (proxyUrl) {
+    sources.push({ name: "GAS Proxy", url: proxyUrl + "?metric=" + metric, parse: parseBitbo });
+  }
+  // 2. Local server.js proxy
+  sources.push({ name: "Local Proxy", url: "/proxy/bitbo/" + metric, parse: parseBitbo });
+  // 3. CoinMetrics community (for supported metrics)
+  if (cmMetric && cmParse) {
+    sources.push({ name: "CoinMetrics", url: cmUrl(cmMetric), parse: cmParse });
+  }
+  // 4. CORS proxy wrappers
+  const bitboUrl = BITBO_BASE + bitboPath;
+  sources.push({ name: "AllOrigins", url: "https://api.allorigins.win/raw?url=" + encodeURIComponent(bitboUrl), parse: parseBitbo });
+  sources.push({ name: "Corsproxy", url: "https://corsproxy.io/?" + encodeURIComponent(bitboUrl), parse: parseBitbo });
+  return sources;
+}
+
+// CoinMetrics parsers — these map CM metrics to the same scale as Bitbo
+function cmParseMVRV(d) {
+  // CM CapMVRVCur is MVRV ratio; our thresholds use Z-Score
+  // Approximate Z from ratio: Z ≈ (MVRV - mean) / std ≈ (MVRV - 1.65) / 1.3
+  const v = d?.data?.[0]?.CapMVRVCur;
+  if (!v) return null;
+  const mvrv = parseFloat(v);
+  return (mvrv - 1.65) / 1.3; // approximate Z-Score
+}
+function cmParseNUPL(d) {
+  // NUPL = (MCap - RCap) / MCap
+  const row = d?.data?.[0];
+  if (!row?.CapMrktCurUSD || !row?.CapRealUSD) return null;
+  const mc = parseFloat(row.CapMrktCurUSD);
+  const rc = parseFloat(row.CapRealUSD);
+  return mc > 0 ? (mc - rc) / mc : null;
+}
+
+function buildAllSources(proxyUrl) {
+  return {
+    price: [
+      { name: "CoinGecko", url: "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", parse: (d) => d?.bitcoin?.usd },
+      { name: "Blockchain.info", url: "https://blockchain.info/ticker", parse: (d) => d?.USD?.last },
+    ],
+    mvrv: buildOCSources("mvrv-z", "/mvrv-z/?latest=true", "CapMVRVCur", cmParseMVRV, proxyUrl),
+    puell: buildOCSources("puell-multiple", "/puell-multiple/?latest=true", null, null, proxyUrl),
+    supplyProfit: buildOCSources("supply-in-profit", "/supply-in-profit/?latest=true", null, null, proxyUrl),
+    nupl: buildOCSources("nupl", "/nupl/?latest=true", "CapMrktCurUSD,CapRealUSD", cmParseNUPL, proxyUrl),
+  };
+}
 
 async function fetchWithFallback(sources) {
   for (const src of sources) {
@@ -364,6 +409,7 @@ function DCAEngine() {
   const [nupl, setNupl] = useState(null); const [nuplSrc, setNuplSrc] = useState(null);
   const [ocManualMode, setOcManualMode] = useState(false);
   const [ocFetchFailed, setOcFetchFailed] = useState(false);
+  const [proxyUrl, setProxyUrl] = useState(saved.current?.proxyUrl ?? "");
   const [dryPowder, setDryPowder] = useState(saved.current?.dryPowder ?? 470);
   const [piCycle, setPiCycle] = useState(false);
   const [capitulation, setCapitulation] = useState(false);
@@ -392,17 +438,18 @@ function DCAEngine() {
   const goalProgress = (totalBTC / USER_GOAL * 100).toFixed(1);
   const btcRemaining = Math.max(0, USER_GOAL - totalBTC);
 
-  // Persist purchases and dry powder
+  // Persist purchases, dry powder, and proxy URL
   useEffect(() => {
-    saveState({ purchases, dryPowder });
-  }, [purchases, dryPowder]);
+    saveState({ purchases, dryPowder, proxyUrl });
+  }, [purchases, dryPowder, proxyUrl]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    const sources = buildAllSources(proxyUrl.trim() || null);
     const [p, m, pu, s, n] = await Promise.all([
-      fetchWithFallback(API_SOURCES.price), fetchWithFallback(API_SOURCES.mvrv),
-      fetchWithFallback(API_SOURCES.puell), fetchWithFallback(API_SOURCES.supplyProfit),
-      fetchWithFallback(API_SOURCES.nupl),
+      fetchWithFallback(sources.price), fetchWithFallback(sources.mvrv),
+      fetchWithFallback(sources.puell), fetchWithFallback(sources.supplyProfit),
+      fetchWithFallback(sources.nupl),
     ]);
     if (p.value) { setPrice(p.value); setPriceSrc(p.source); }
     if (m.value !== null) { setMvrv(m.value); setMvrvSrc(m.source); }
@@ -414,7 +461,7 @@ function DCAEngine() {
       setOcFetchFailed(true);
     }
     setLastFetch(new Date()); setLoading(false);
-  }, []);
+  }, [proxyUrl]);
 
   useEffect(() => { refresh(); const iv = setInterval(refresh, 300000); return () => clearInterval(iv); }, [refresh]);
 
@@ -492,7 +539,7 @@ function DCAEngine() {
       {/* TABS */}
       <div className="tab-bar" style={{ display: "flex", gap: 1, marginBottom: 16 }}>
         {[["model","⚡ MODEL"],["exec","📊 EXEC"],["recovery","🔗 CHAIN"],["ledger","📋 LEDGER"],["params","🔧 PARAMS"]].map(([k,l])=>(
-          <button key={k} onClick={()=>setTab(k)} style={{ padding:"6px 14px",fontSize:11,fontWeight:700,letterSpacing:"0.04em",background:tab===k?"#1e293b":"transparent",color:tab===k?"#f7931a":"#475569",border:"none",borderBottom:tab===k?"2px solid #f7931a":"2px solid transparent",cursor:"pointer",fontFamily:"'JetBrains Mono',monospace" }}>{l}</button>
+          <button key={k} data-tab={k} onClick={()=>setTab(k)} style={{ padding:"6px 14px",fontSize:11,fontWeight:700,letterSpacing:"0.04em",background:tab===k?"#1e293b":"transparent",color:tab===k?"#f7931a":"#475569",border:"none",borderBottom:tab===k?"2px solid #f7931a":"2px solid transparent",cursor:"pointer",fontFamily:"'JetBrains Mono',monospace" }}>{l}</button>
         ))}
       </div>
 
@@ -513,7 +560,7 @@ function DCAEngine() {
               <div style={{ background: "#0c1220", border: "1px solid #f59e0b33", borderRadius: 8, padding: 12, marginBottom: 14 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
                   <span style={{ fontSize: 10, fontWeight: 700, color: "#f59e0b", textTransform: "uppercase", letterSpacing: "0.08em" }}>
-                    {ocFetchFailed && !ocManualMode ? "⚠ On-chain APIs blocked (CORS) — enter manually" : "Manual On-Chain Input"}
+                    {ocFetchFailed && !ocManualMode ? "⚠ On-chain APIs need proxy — set up in PARAMS tab, or enter manually" : "Manual On-Chain Input"}
                   </span>
                   <button onClick={() => { setOcManualMode(!ocManualMode); if (ocManualMode) setOcFetchFailed(false); }} style={{ fontSize: 9, padding: "3px 8px", background: "transparent", border: "1px solid #f59e0b44", color: "#f59e0b", borderRadius: 3, cursor: "pointer" }}>
                     {ocManualMode ? "HIDE" : "MANUAL"}
@@ -521,6 +568,7 @@ function DCAEngine() {
                 </div>
                 <div style={{ fontSize: 9, color: "#64748b", marginBottom: 10 }}>
                   Get values from <a href="https://charts.bitbo.io/mvrv-z-score/" target="_blank" rel="noopener" style={{ color: "#60a5fa" }}>bitbo.io</a> or <a href="https://www.bitcoinmagazinepro.com/charts/mvrv-zscore/" target="_blank" rel="noopener" style={{ color: "#60a5fa" }}>bitcoinmagazinepro.com</a>
+                  {ocFetchFailed && !proxyUrl && <span> · <span style={{ color: "#f59e0b", cursor: "pointer", textDecoration: "underline" }} onClick={() => setTab("params")}>Set up auto-proxy in PARAMS →</span></span>}
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
                   {[
@@ -897,6 +945,78 @@ function DCAEngine() {
                 </div>
               </div>
             ))}
+          </div>
+          <div style={{ background: "#0c1220", border: "1px solid #f59e0b33", borderRadius: 8, padding: 16, marginBottom: 14 }}>
+            <h3 style={{ fontSize: 13, fontWeight: 700, color: "#f59e0b", margin: "0 0 10px 0" }}>On-Chain Data Proxy</h3>
+            <div style={{ fontSize: 10, color: "#94a3b8", lineHeight: 1.7, marginBottom: 12 }}>
+              Bitbo's API blocks browser requests (CORS). Set up a free Google Apps Script proxy to fix this permanently:
+            </div>
+            <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 6, padding: 12, marginBottom: 12, fontSize: 10, color: "#64748b", lineHeight: 1.8 }}>
+              <div style={{ color: "#f59e0b", fontWeight: 700, marginBottom: 4 }}>One-Time Setup (2 min):</div>
+              <div>1. Go to <a href="https://script.google.com" target="_blank" rel="noopener" style={{ color: "#60a5fa" }}>script.google.com</a> → New Project</div>
+              <div>2. Delete everything, paste the code below</div>
+              <div>3. Click <b style={{ color: "#e2e8f0" }}>Deploy → New deployment</b></div>
+              <div>4. Type = <b style={{ color: "#e2e8f0" }}>Web app</b>, Execute as = <b style={{ color: "#e2e8f0" }}>Me</b>, Access = <b style={{ color: "#e2e8f0" }}>Anyone</b></div>
+              <div>5. Click <b style={{ color: "#e2e8f0" }}>Deploy</b>, authorize when prompted, copy the URL</div>
+              <div>6. Paste URL below and hit <b style={{ color: "#e2e8f0" }}>TEST</b></div>
+            </div>
+            <div style={{ position: "relative", marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <span style={{ fontSize: 9, color: "#475569", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em" }}>Google Apps Script Code:</span>
+                <button onClick={() => {
+                  const code = `function doGet(e) {\n  var metric = e.parameter.metric || "mvrv-z";\n  var endpoints = {\n    "mvrv-z": "/mvrv-z/?latest=true",\n    "puell-multiple": "/puell-multiple/?latest=true",\n    "supply-in-profit": "/supply-in-profit/?latest=true",\n    "nupl": "/nupl/?latest=true"\n  };\n  var path = endpoints[metric] || endpoints["mvrv-z"];\n  var url = "https://charts.bitbo.io/api/v1" + path;\n  var resp = UrlFetchApp.fetch(url, {muteHttpExceptions: true});\n  return ContentService\n    .createTextOutput(resp.getContentText())\n    .setMimeType(ContentService.MimeType.JSON);\n}`;
+                  navigator.clipboard?.writeText(code);
+                }} style={{ fontSize: 9, padding: "3px 10px", background: "#22c55e15", border: "1px solid #22c55e44", color: "#22c55e", borderRadius: 3, cursor: "pointer" }}>COPY</button>
+              </div>
+              <pre style={{ background: "#0a0e18", border: "1px solid #1e293b", borderRadius: 4, padding: 10, fontSize: 9, color: "#22c55e", fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.6, overflow: "auto", maxHeight: 180, whiteSpace: "pre-wrap", margin: 0 }}>{`function doGet(e) {
+  var metric = e.parameter.metric || "mvrv-z";
+  var endpoints = {
+    "mvrv-z": "/mvrv-z/?latest=true",
+    "puell-multiple": "/puell-multiple/?latest=true",
+    "supply-in-profit": "/supply-in-profit/?latest=true",
+    "nupl": "/nupl/?latest=true"
+  };
+  var path = endpoints[metric] || endpoints["mvrv-z"];
+  var url = "https://charts.bitbo.io/api/v1" + path;
+  var resp = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+  return ContentService
+    .createTextOutput(resp.getContentText())
+    .setMimeType(ContentService.MimeType.JSON);
+}`}</pre>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+              <div style={{ flex: 1 }}>
+                <label style={{ display: "block", fontSize: 9, color: "#475569", fontWeight: 700, marginBottom: 3, textTransform: "uppercase", letterSpacing: "0.08em" }}>Deployed Proxy URL</label>
+                <input
+                  type="url" placeholder="https://script.google.com/macros/s/.../exec"
+                  value={proxyUrl}
+                  onChange={(e) => setProxyUrl(e.target.value)}
+                  style={{ width: "100%", padding: "7px 10px", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 4, color: "#e2e8f0", fontSize: 11, fontFamily: "'JetBrains Mono', monospace", outline: "none", boxSizing: "border-box" }}
+                />
+              </div>
+              <button onClick={async () => {
+                if (!proxyUrl.trim()) return;
+                try {
+                  const r = await fetch(proxyUrl.trim() + "?metric=mvrv-z", { signal: AbortSignal.timeout(10000) });
+                  const d = await r.json();
+                  const v = parseBitbo(d);
+                  if (v !== null) {
+                    alert("Proxy works! MVRV Z = " + v.toFixed(2) + "\nOn-chain data will now auto-load.");
+                    refresh();
+                  } else {
+                    alert("Proxy responded but data is unexpected.\nCheck the script deployment.");
+                  }
+                } catch(err) {
+                  alert("Proxy unreachable: " + err.message + "\n\nCheck:\n- Deploy type = Web app\n- Access = Anyone\n- URL ends with /exec");
+                }
+              }} style={{ padding: "7px 16px", background: "#f59e0b", color: "#080c14", border: "none", borderRadius: 4, fontWeight: 800, fontSize: 11, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0 }}>
+                TEST
+              </button>
+              {proxyUrl && <button onClick={() => { setProxyUrl(""); }} style={{ padding: "7px 10px", background: "transparent", border: "1px solid #ef444444", color: "#ef4444", borderRadius: 4, fontSize: 10, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0 }}>CLEAR</button>}
+            </div>
+            <div style={{ fontSize: 9, color: "#334155", marginTop: 6 }}>
+              Alt: run <code style={{ color: "#64748b" }}>node server.js</code> locally (see README) · URL is saved in localStorage
+            </div>
           </div>
           <div style={{ background: "#0c1220", border: "1px solid #16a34a33", borderRadius: 8, padding: 16 }}>
             <h3 style={{ fontSize: 13, fontWeight: 700, color: "#22c55e", margin: "0 0 10px 0" }}>Validation</h3>

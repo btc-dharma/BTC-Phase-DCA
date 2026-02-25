@@ -1,4 +1,4 @@
-const CACHE_NAME = 'dca-engine-v23';
+const CACHE_NAME = 'dca-engine-v23c';
 const ASSETS = [
   './',
   './index.html',
@@ -27,7 +27,7 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   // API calls: network-first (always try live data)
-  if (url.hostname.includes('coingecko') || url.hostname.includes('blockchain.info') || url.hostname.includes('bitbo')) {
+  if (url.hostname.includes('coingecko') || url.hostname.includes('blockchain.info') || url.hostname.includes('bitbo') || url.hostname.includes('allorigins') || url.hostname.includes('corsproxy') || url.hostname.includes('coinmetrics') || url.hostname.includes('script.google.com') || url.hostname.includes('script.googleusercontent.com') || url.pathname.startsWith('/proxy/')) {
     e.respondWith(
       fetch(e.request).then((res) => {
         const clone = res.clone();
