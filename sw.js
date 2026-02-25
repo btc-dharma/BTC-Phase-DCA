@@ -1,4 +1,4 @@
-const CACHE_NAME = 'dca-engine-v23e';
+const CACHE_NAME = 'dca-engine-v23f';
 const ASSETS = [
   './',
   './index.html',

@@ -34,7 +34,7 @@ app.use(express.static(path.join(__dirname), {
 }));
 
 // ── CoinMetrics Community API proxy ──
-const CM_BASE = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&frequency=1d&sort=desc";
+const CM_BASE = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&frequency=1d&paging_from=end";
 const METRIC_CONFIGS = {
   "mvrv-z":         { url: CM_BASE + "&page_size=1&metrics=CapMVRVCur", parse: (d) => { const v = parseFloat(d?.data?.[0]?.CapMVRVCur); return isNaN(v) ? null : Math.round(((v - 1.65) / 1.3) * 1000) / 1000; } },
   "puell-multiple": { url: CM_BASE + "&page_size=365&metrics=RevUSD", parse: (d) => { if (!d?.data || d.data.length < 300) return null; const vals = d.data.map(r => parseFloat(r.RevUSD)).filter(v => !isNaN(v)); const today = vals[0]; const avg = vals.reduce((s,v) => s+v, 0) / vals.length; return avg > 0 ? Math.round((today / avg) * 1000) / 1000 : null; } },
