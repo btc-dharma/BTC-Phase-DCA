@@ -36,10 +36,10 @@ app.use(express.static(path.join(__dirname), {
 // ── CoinMetrics Community API proxy ──
 const CM_BASE = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&frequency=1d&sort=desc";
 const METRIC_CONFIGS = {
-  "mvrv-z":         { url: CM_BASE + "&limit_per_metric=1&metrics=CapMVRVCur", parse: (d) => { const v = parseFloat(d?.data?.[0]?.CapMVRVCur); return isNaN(v) ? null : Math.round(((v - 1.65) / 1.3) * 1000) / 1000; } },
-  "puell-multiple": { url: CM_BASE + "&limit_per_metric=365&metrics=RevUSD", parse: (d) => { if (!d?.data || d.data.length < 300) return null; const vals = d.data.map(r => parseFloat(r.RevUSD)).filter(v => !isNaN(v)); const today = vals[0]; const avg = vals.reduce((s,v) => s+v, 0) / vals.length; return avg > 0 ? Math.round((today / avg) * 1000) / 1000 : null; } },
-  "supply-in-profit": { url: CM_BASE + "&limit_per_metric=1&metrics=SplyActPct1yr", parse: (d) => { const v = parseFloat(d?.data?.[0]?.SplyActPct1yr); return isNaN(v) ? null : v; } },
-  "nupl":           { url: CM_BASE + "&limit_per_metric=1&metrics=CapMrktCurUSD,CapRealUSD", parse: (d) => { const mc = parseFloat(d?.data?.[0]?.CapMrktCurUSD); const rc = parseFloat(d?.data?.[0]?.CapRealUSD); return (mc > 0) ? Math.round(((mc - rc) / mc) * 10000) / 10000 : null; } },
+  "mvrv-z":         { url: CM_BASE + "&page_size=1&metrics=CapMVRVCur", parse: (d) => { const v = parseFloat(d?.data?.[0]?.CapMVRVCur); return isNaN(v) ? null : Math.round(((v - 1.65) / 1.3) * 1000) / 1000; } },
+  "puell-multiple": { url: CM_BASE + "&page_size=365&metrics=RevUSD", parse: (d) => { if (!d?.data || d.data.length < 300) return null; const vals = d.data.map(r => parseFloat(r.RevUSD)).filter(v => !isNaN(v)); const today = vals[0]; const avg = vals.reduce((s,v) => s+v, 0) / vals.length; return avg > 0 ? Math.round((today / avg) * 1000) / 1000 : null; } },
+  "supply-in-profit": { url: CM_BASE + "&page_size=1&metrics=SplyActPct1yr", parse: (d) => { const v = parseFloat(d?.data?.[0]?.SplyActPct1yr); return isNaN(v) ? null : v; } },
+  "nupl":           { url: CM_BASE + "&page_size=1&metrics=CapMrktCurUSD,CapRealUSD", parse: (d) => { const mc = parseFloat(d?.data?.[0]?.CapMrktCurUSD); const rc = parseFloat(d?.data?.[0]?.CapRealUSD); return (mc > 0) ? Math.round(((mc - rc) / mc) * 10000) / 10000 : null; } },
 };
 
 // Cache to avoid hammering Bitbo (cache for 10 minutes)

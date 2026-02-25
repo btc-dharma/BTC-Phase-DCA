@@ -106,7 +106,7 @@ function saveState(data) {
 
 const CM_BASE = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics";
 function cmUrl(metrics, limit) {
-  return CM_BASE + "?assets=btc&metrics=" + metrics + "&frequency=1d&limit_per_metric=" + (limit || 1) + "&sort=desc";
+  return CM_BASE + "?assets=btc&metrics=" + metrics + "&frequency=1d&page_size=" + (limit || 1) + "&sort=desc";
 }
 
 // Unified response format from GAS proxy: {metric: "mvrv-z", value: 2.15, source: "CoinMetrics"}
@@ -967,7 +967,7 @@ function DCAEngine() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
                 <span style={{ fontSize: 9, color: "#475569", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em" }}>Google Apps Script Code:</span>
                 <button onClick={() => {
-                  const code = `function doGet(e) {\n  var metric = e.parameter.metric || "mvrv-z";\n  var CM = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&frequency=1d&sort=desc&limit_per_metric=";\n  var result = {metric: metric, value: null, source: "CoinMetrics", error: null};\n  try {\n    if (metric === "mvrv-z") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "1&metrics=CapMVRVCur").getContentText());\n      var mvrv = parseFloat(d.data[0].CapMVRVCur);\n      result.value = Math.round(((mvrv - 1.65) / 1.3) * 1000) / 1000;\n      result.raw_mvrv_ratio = mvrv;\n    } else if (metric === "nupl") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "1&metrics=CapMrktCurUSD,CapRealUSD").getContentText());\n      var mc = parseFloat(d.data[0].CapMrktCurUSD);\n      var rc = parseFloat(d.data[0].CapRealUSD);\n      result.value = Math.round(((mc - rc) / mc) * 10000) / 10000;\n    } else if (metric === "puell-multiple") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "365&metrics=RevUSD").getContentText());\n      var vals = d.data.map(function(r) { return parseFloat(r.RevUSD); });\n      var today = vals[0];\n      var sum = 0; for (var i = 0; i < vals.length; i++) sum += vals[i];\n      result.value = Math.round((today / (sum / vals.length)) * 1000) / 1000;\n    } else if (metric === "supply-in-profit") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "1&metrics=SplyActPct1yr").getContentText());\n      result.value = parseFloat(d.data[0].SplyActPct1yr);\n    } else {\n      result.error = "Unknown metric: " + metric;\n    }\n  } catch(err) {\n    result.error = err.toString();\n  }\n  return ContentService.createTextOutput(JSON.stringify(result)).setMimeType(ContentService.MimeType.JSON);\n}`;
+                  const code = `function doGet(e) {\n  var metric = e.parameter.metric || "mvrv-z";\n  var CM = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&frequency=1d&sort=desc&page_size=";\n  var result = {metric: metric, value: null, source: "CoinMetrics", error: null};\n  try {\n    if (metric === "mvrv-z") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "1&metrics=CapMVRVCur").getContentText());\n      var mvrv = parseFloat(d.data[0].CapMVRVCur);\n      result.value = Math.round(((mvrv - 1.65) / 1.3) * 1000) / 1000;\n      result.raw_mvrv_ratio = mvrv;\n    } else if (metric === "nupl") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "1&metrics=CapMrktCurUSD,CapRealUSD").getContentText());\n      var mc = parseFloat(d.data[0].CapMrktCurUSD);\n      var rc = parseFloat(d.data[0].CapRealUSD);\n      result.value = Math.round(((mc - rc) / mc) * 10000) / 10000;\n    } else if (metric === "puell-multiple") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "365&metrics=RevUSD").getContentText());\n      var vals = d.data.map(function(r) { return parseFloat(r.RevUSD); });\n      var today = vals[0];\n      var sum = 0; for (var i = 0; i < vals.length; i++) sum += vals[i];\n      result.value = Math.round((today / (sum / vals.length)) * 1000) / 1000;\n    } else if (metric === "supply-in-profit") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "1&metrics=SplyActPct1yr").getContentText());\n      result.value = parseFloat(d.data[0].SplyActPct1yr);\n    } else {\n      result.error = "Unknown metric: " + metric;\n    }\n  } catch(err) {\n    result.error = err.toString();\n  }\n  return ContentService.createTextOutput(JSON.stringify(result)).setMimeType(ContentService.MimeType.JSON);\n}`;
                   navigator.clipboard?.writeText(code);
                 }} style={{ fontSize: 9, padding: "3px 10px", background: "#22c55e15", border: "1px solid #22c55e44", color: "#22c55e", borderRadius: 3, cursor: "pointer" }}>COPY</button>
               </div>
@@ -975,7 +975,7 @@ function DCAEngine() {
   var metric = e.parameter.metric || "mvrv-z";
   var CM = "https://community-api.coinmetrics.io/v4/" +
     "timeseries/asset-metrics?assets=btc" +
-    "&frequency=1d&sort=desc&limit_per_metric=";
+    "&frequency=1d&sort=desc&page_size=";
   var result = {metric: metric, value: null,
     source: "CoinMetrics", error: null};
   try {
