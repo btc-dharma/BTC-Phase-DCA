@@ -99,69 +99,72 @@ function saveState(data) {
 }
 
 // ── API ──
-// On-chain data source priority:
-//   1. User's Google Apps Script proxy (if configured)
-//   2. Local proxy (server.js)
-//   3. CoinMetrics community API (free, CORS-enabled, partial coverage)
-//   4. CORS proxy wrappers for Bitbo
-//   5. Manual entry
+// On-chain data sources:
+//   1. User's Google Apps Script proxy → CoinMetrics (server-side, no CORS/auth issues)
+//   2. CoinMetrics community API direct (free, CORS-enabled)
+//   3. Manual entry
 
-const BITBO_BASE = "https://charts.bitbo.io/api/v1";
-const parseBitbo = (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null;
-
-// CoinMetrics community API — free, no key, CORS-enabled
 const CM_BASE = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics";
-function cmUrl(metrics) {
-  return CM_BASE + "?assets=btc&metrics=" + metrics + "&frequency=1d&limit_per_metric=1&sort=desc";
+function cmUrl(metrics, limit) {
+  return CM_BASE + "?assets=btc&metrics=" + metrics + "&frequency=1d&limit_per_metric=" + (limit || 1) + "&sort=desc";
 }
 
-function buildOCSources(metric, bitboPath, cmMetric, cmParse, proxyUrl) {
-  const sources = [];
-  // 1. User's Google Apps Script proxy (highest priority)
-  if (proxyUrl) {
-    sources.push({ name: "GAS Proxy", url: proxyUrl + "?metric=" + metric, parse: parseBitbo });
-  }
-  // 2. Local server.js proxy
-  sources.push({ name: "Local Proxy", url: "/proxy/bitbo/" + metric, parse: parseBitbo });
-  // 3. CoinMetrics community (for supported metrics)
-  if (cmMetric && cmParse) {
-    sources.push({ name: "CoinMetrics", url: cmUrl(cmMetric), parse: cmParse });
-  }
-  // 4. CORS proxy wrappers
-  const bitboUrl = BITBO_BASE + bitboPath;
-  sources.push({ name: "AllOrigins", url: "https://api.allorigins.win/raw?url=" + encodeURIComponent(bitboUrl), parse: parseBitbo });
-  sources.push({ name: "Corsproxy", url: "https://corsproxy.io/?" + encodeURIComponent(bitboUrl), parse: parseBitbo });
-  return sources;
-}
+// Unified response format from GAS proxy: {metric: "mvrv-z", value: 2.15, source: "CoinMetrics"}
+const parseGASProxy = (d) => (d?.value !== undefined && d?.value !== null) ? parseFloat(d.value) : null;
 
-// CoinMetrics parsers — these map CM metrics to the same scale as Bitbo
+// CoinMetrics direct parsers
 function cmParseMVRV(d) {
-  // CM CapMVRVCur is MVRV ratio; our thresholds use Z-Score
-  // Approximate Z from ratio: Z ≈ (MVRV - mean) / std ≈ (MVRV - 1.65) / 1.3
   const v = d?.data?.[0]?.CapMVRVCur;
   if (!v) return null;
   const mvrv = parseFloat(v);
-  return (mvrv - 1.65) / 1.3; // approximate Z-Score
+  // Approximate Z from ratio: Z ≈ (MVRV - mean) / std
+  return (mvrv - 1.65) / 1.3;
 }
 function cmParseNUPL(d) {
-  // NUPL = (MCap - RCap) / MCap
   const row = d?.data?.[0];
   if (!row?.CapMrktCurUSD || !row?.CapRealUSD) return null;
   const mc = parseFloat(row.CapMrktCurUSD);
   const rc = parseFloat(row.CapRealUSD);
   return mc > 0 ? (mc - rc) / mc : null;
 }
+function cmParsePuell(d) {
+  // Puell = today's issuance USD / 365-day MA of issuance USD
+  if (!d?.data || d.data.length < 300) return null;
+  const vals = d.data.map(r => parseFloat(r.RevUSD)).filter(v => !isNaN(v));
+  if (vals.length < 300) return null;
+  const today = vals[0];
+  const avg = vals.reduce((s, v) => s + v, 0) / vals.length;
+  return avg > 0 ? today / avg : null;
+}
+function cmParseSupply(d) {
+  const row = d?.data?.[0];
+  if (!row?.SplyActPct1yr) return null;
+  // SplyActPct1yr is % of supply active in last year — rough proxy for supply in profit
+  // during bear markets. Direct supply-in-profit isn't in community API.
+  return parseFloat(row.SplyActPct1yr);
+}
 
 function buildAllSources(proxyUrl) {
+  const pxy = proxyUrl?.trim() || null;
+  function withProxy(metric, cmMetric, cmParse, cmLimit) {
+    const sources = [];
+    if (pxy) {
+      sources.push({ name: "GAS Proxy", url: pxy + (pxy.includes("?") ? "&" : "?") + "metric=" + metric, parse: parseGASProxy });
+    }
+    if (cmMetric && cmParse) {
+      sources.push({ name: "CoinMetrics", url: cmUrl(cmMetric, cmLimit || 1), parse: cmParse });
+    }
+    return sources;
+  }
   return {
     price: [
       { name: "CoinGecko", url: "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", parse: (d) => d?.bitcoin?.usd },
       { name: "Blockchain.info", url: "https://blockchain.info/ticker", parse: (d) => d?.USD?.last },
     ],
-    mvrv: buildOCSources("mvrv-z", "/mvrv-z/?latest=true", "CapMVRVCur", cmParseMVRV, proxyUrl),
-    puell: buildOCSources("puell-multiple", "/puell-multiple/?latest=true", null, null, proxyUrl),
-    supplyProfit: buildOCSources("supply-in-profit", "/supply-in-profit/?latest=true", null, null, proxyUrl),
-    nupl: buildOCSources("nupl", "/nupl/?latest=true", "CapMrktCurUSD,CapRealUSD", cmParseNUPL, proxyUrl),
+    mvrv: withProxy("mvrv-z", "CapMVRVCur", cmParseMVRV),
+    puell: withProxy("puell-multiple", "RevUSD", cmParsePuell, 365),
+    supplyProfit: withProxy("supply-in-profit", "SplyActPct1yr", cmParseSupply),
+    nupl: withProxy("nupl", "CapMrktCurUSD,CapRealUSD", cmParseNUPL),
   };
 }
 
@@ -949,7 +952,7 @@ function DCAEngine() {
           <div style={{ background: "#0c1220", border: "1px solid #f59e0b33", borderRadius: 8, padding: 16, marginBottom: 14 }}>
             <h3 style={{ fontSize: 13, fontWeight: 700, color: "#f59e0b", margin: "0 0 10px 0" }}>On-Chain Data Proxy</h3>
             <div style={{ fontSize: 10, color: "#94a3b8", lineHeight: 1.7, marginBottom: 12 }}>
-              Bitbo's API blocks browser requests (CORS). Set up a free Google Apps Script proxy to fix this permanently:
+              Fetches on-chain data from CoinMetrics (free API) via your own Google Apps Script — no auth keys, no CORS issues.
             </div>
             <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 6, padding: 12, marginBottom: 12, fontSize: 10, color: "#64748b", lineHeight: 1.8 }}>
               <div style={{ color: "#f59e0b", fontWeight: 700, marginBottom: 4 }}>One-Time Setup (2 min):</div>
@@ -964,23 +967,56 @@ function DCAEngine() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
                 <span style={{ fontSize: 9, color: "#475569", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em" }}>Google Apps Script Code:</span>
                 <button onClick={() => {
-                  const code = `function doGet(e) {\n  var metric = e.parameter.metric || "mvrv-z";\n  var endpoints = {\n    "mvrv-z": "/mvrv-z/?latest=true",\n    "puell-multiple": "/puell-multiple/?latest=true",\n    "supply-in-profit": "/supply-in-profit/?latest=true",\n    "nupl": "/nupl/?latest=true"\n  };\n  var path = endpoints[metric] || endpoints["mvrv-z"];\n  var url = "https://charts.bitbo.io/api/v1" + path;\n  var resp = UrlFetchApp.fetch(url, {muteHttpExceptions: true});\n  return ContentService\n    .createTextOutput(resp.getContentText())\n    .setMimeType(ContentService.MimeType.JSON);\n}`;
+                  const code = `function doGet(e) {\n  var metric = e.parameter.metric || "mvrv-z";\n  var CM = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&frequency=1d&sort=desc&limit_per_metric=";\n  var result = {metric: metric, value: null, source: "CoinMetrics", error: null};\n  try {\n    if (metric === "mvrv-z") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "1&metrics=CapMVRVCur").getContentText());\n      var mvrv = parseFloat(d.data[0].CapMVRVCur);\n      result.value = Math.round(((mvrv - 1.65) / 1.3) * 1000) / 1000;\n      result.raw_mvrv_ratio = mvrv;\n    } else if (metric === "nupl") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "1&metrics=CapMrktCurUSD,CapRealUSD").getContentText());\n      var mc = parseFloat(d.data[0].CapMrktCurUSD);\n      var rc = parseFloat(d.data[0].CapRealUSD);\n      result.value = Math.round(((mc - rc) / mc) * 10000) / 10000;\n    } else if (metric === "puell-multiple") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "365&metrics=RevUSD").getContentText());\n      var vals = d.data.map(function(r) { return parseFloat(r.RevUSD); });\n      var today = vals[0];\n      var sum = 0; for (var i = 0; i < vals.length; i++) sum += vals[i];\n      result.value = Math.round((today / (sum / vals.length)) * 1000) / 1000;\n    } else if (metric === "supply-in-profit") {\n      var d = JSON.parse(UrlFetchApp.fetch(CM + "1&metrics=SplyActPct1yr").getContentText());\n      result.value = parseFloat(d.data[0].SplyActPct1yr);\n    } else {\n      result.error = "Unknown metric: " + metric;\n    }\n  } catch(err) {\n    result.error = err.toString();\n  }\n  return ContentService.createTextOutput(JSON.stringify(result)).setMimeType(ContentService.MimeType.JSON);\n}`;
                   navigator.clipboard?.writeText(code);
                 }} style={{ fontSize: 9, padding: "3px 10px", background: "#22c55e15", border: "1px solid #22c55e44", color: "#22c55e", borderRadius: 3, cursor: "pointer" }}>COPY</button>
               </div>
-              <pre style={{ background: "#0a0e18", border: "1px solid #1e293b", borderRadius: 4, padding: 10, fontSize: 9, color: "#22c55e", fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.6, overflow: "auto", maxHeight: 180, whiteSpace: "pre-wrap", margin: 0 }}>{`function doGet(e) {
+              <pre style={{ background: "#0a0e18", border: "1px solid #1e293b", borderRadius: 4, padding: 10, fontSize: 9, color: "#22c55e", fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.6, overflow: "auto", maxHeight: 200, whiteSpace: "pre-wrap", margin: 0 }}>{`function doGet(e) {
   var metric = e.parameter.metric || "mvrv-z";
-  var endpoints = {
-    "mvrv-z": "/mvrv-z/?latest=true",
-    "puell-multiple": "/puell-multiple/?latest=true",
-    "supply-in-profit": "/supply-in-profit/?latest=true",
-    "nupl": "/nupl/?latest=true"
-  };
-  var path = endpoints[metric] || endpoints["mvrv-z"];
-  var url = "https://charts.bitbo.io/api/v1" + path;
-  var resp = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+  var CM = "https://community-api.coinmetrics.io/v4/" +
+    "timeseries/asset-metrics?assets=btc" +
+    "&frequency=1d&sort=desc&limit_per_metric=";
+  var result = {metric: metric, value: null,
+    source: "CoinMetrics", error: null};
+  try {
+    if (metric === "mvrv-z") {
+      var d = JSON.parse(UrlFetchApp.fetch(
+        CM + "1&metrics=CapMVRVCur").getContentText());
+      var mvrv = parseFloat(d.data[0].CapMVRVCur);
+      result.value = Math.round(
+        ((mvrv - 1.65) / 1.3) * 1000) / 1000;
+      result.raw_mvrv_ratio = mvrv;
+    } else if (metric === "nupl") {
+      var d = JSON.parse(UrlFetchApp.fetch(CM +
+        "1&metrics=CapMrktCurUSD,CapRealUSD"
+        ).getContentText());
+      var mc = parseFloat(d.data[0].CapMrktCurUSD);
+      var rc = parseFloat(d.data[0].CapRealUSD);
+      result.value = Math.round(
+        ((mc - rc) / mc) * 10000) / 10000;
+    } else if (metric === "puell-multiple") {
+      var d = JSON.parse(UrlFetchApp.fetch(
+        CM + "365&metrics=RevUSD").getContentText());
+      var vals = d.data.map(function(r) {
+        return parseFloat(r.RevUSD); });
+      var today = vals[0];
+      var sum = 0;
+      for (var i = 0; i < vals.length; i++) sum += vals[i];
+      result.value = Math.round(
+        (today / (sum / vals.length)) * 1000) / 1000;
+    } else if (metric === "supply-in-profit") {
+      var d = JSON.parse(UrlFetchApp.fetch(CM +
+        "1&metrics=SplyActPct1yr").getContentText());
+      result.value =
+        parseFloat(d.data[0].SplyActPct1yr);
+    } else {
+      result.error = "Unknown metric: " + metric;
+    }
+  } catch(err) {
+    result.error = err.toString();
+  }
   return ContentService
-    .createTextOutput(resp.getContentText())
+    .createTextOutput(JSON.stringify(result))
     .setMimeType(ContentService.MimeType.JSON);
 }`}</pre>
             </div>
@@ -997,14 +1033,23 @@ function DCAEngine() {
               <button onClick={async () => {
                 if (!proxyUrl.trim()) return;
                 try {
-                  const r = await fetch(proxyUrl.trim() + "?metric=mvrv-z", { signal: AbortSignal.timeout(10000) });
-                  const d = await r.json();
-                  const v = parseBitbo(d);
-                  if (v !== null) {
-                    alert("Proxy works! MVRV Z = " + v.toFixed(2) + "\nOn-chain data will now auto-load.");
+                  const testUrl = proxyUrl.trim() + (proxyUrl.trim().includes("?") ? "&" : "?") + "metric=mvrv-z";
+                  const r = await fetch(testUrl, { redirect: "follow", signal: AbortSignal.timeout(15000) });
+                  const txt = await r.text();
+                  let d; try { d = JSON.parse(txt); } catch(pe) {
+                    alert("Proxy returned non-JSON:\n\n" + txt.slice(0, 500) + "\n\nMake sure Deploy type = Web app & Access = Anyone");
+                    return;
+                  }
+                  if (d.error) {
+                    alert("Proxy returned error:\n" + d.error + "\n\nThe CoinMetrics API may be down. Try again in a few minutes.");
+                    return;
+                  }
+                  const v = d.value !== undefined ? parseFloat(d.value) : null;
+                  if (v !== null && !isNaN(v)) {
+                    alert("Proxy works! MVRV Z-Score = " + v.toFixed(3) + (d.raw_mvrv_ratio ? " (ratio: " + parseFloat(d.raw_mvrv_ratio).toFixed(3) + ")" : "") + "\nSource: " + (d.source || "unknown") + "\n\nOn-chain data will now auto-load.");
                     refresh();
                   } else {
-                    alert("Proxy responded but data is unexpected.\nCheck the script deployment.");
+                    alert("Proxy responded but no value found.\n\nRaw response:\n" + txt.slice(0, 600));
                   }
                 } catch(err) {
                   alert("Proxy unreachable: " + err.message + "\n\nCheck:\n- Deploy type = Web app\n- Access = Anyone\n- URL ends with /exec");
