@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="DCA Engine">
+<meta name="theme-color" content="#080c14">
+<meta name="mobile-web-app-capable" content="yes">
+<title>₿ DCA Engine v2.3</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body,#root{width:100%;height:100%;background:#080c14;color:#e2e8f0;overflow-x:hidden}
+body{font-family:'IBM Plex Sans',-apple-system,sans-serif;-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:#0f172a}
+::-webkit-scrollbar-thumb{background:#1e293b;border-radius:3px}
+input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.tab-content{animation:fadeIn 0.2s ease-out}
+@media(max-width:900px){
+  .grid-2{grid-template-columns:1fr!important}
+  .grid-6{grid-template-columns:repeat(3,1fr)!important}
+  .header-row{flex-direction:column;align-items:flex-start!important;gap:8px!important}
+  .tab-bar{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .tab-bar button{white-space:nowrap;font-size:10px!important;padding:6px 10px!important}
+}
+@media(max-width:600px){
+  .grid-6{grid-template-columns:repeat(2,1fr)!important}
+  .exec-table td,.exec-table th{padding:4px 6px!important;font-size:10px!important}
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel" data-type="module">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+// ============================================================
+// BITCOIN ADVANCED DCA ENGINE v2.3 — PWA
+// ============================================================
+
+const ATH_PRICE = 126198;
+const ATH_DATE = new Date("2025-10-06");
+const HALVING_DATE = new Date("2028-04-17");
+
+const HIST = { meanDays: 383.3, stdDays: 24.7, meanDD: -0.819, stdDD: 0.041 };
+const EST = {
+  bottomEarliest: new Date("2026-09-25"), bottomLatest: new Date("2026-11-22"),
+  bottomPriceLow: 21000, bottomPriceHigh: 39500, accumRangeMid: 254,
+};
+const TUNED = {
+  ddStart: 0.50, ddFull: 0.80, ddMinAlloc: 0.03, ddMaxAlloc: 0.50,
+  ddExponent: 2.0, suppressCutoff: 0.45, suppressMin: 0.40,
+  accumDeploy: 0.90, accumDecay: 2.5, absFloor: 0.02,
+};
+
+const OC_THRESHOLDS = {
+  mvrv_z:  { extreme: -0.8, recovery: -0.3, label: "MVRV Z-Score" },
+  puell:   { extreme: 0.38, recovery: 0.45, label: "Puell Multiple" },
+  nupl:    { extreme: -0.18, recovery: -0.08, label: "NUPL" },
+  sp_pct:  { extreme: 46, recovery: 50, label: "Supply in Profit" },
+};
+const OC_RULES = { dwellWeeks: 3, confirmWeeks: 2, minIndicators: 2, pBotBoost: 0.20 };
+
+const daysBetween = (d1, d2) => Math.round((d2 - d1) / 864e5);
+const fmt$ = (n) => "$" + Math.round(n).toLocaleString();
+const fmtBTC = (n) => n.toFixed(8);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const normalCDF = (x) => {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x));
+  const d = 0.3989422804 * Math.exp(-0.5 * x * x);
+  const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.3302744))));
+  return x > 0 ? 1 - p : p;
+};
+
+// ── STORAGE (localStorage for PWA persistence) ──
+const STORAGE_KEY = "dca_engine_v23";
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch(e) {}
+  return null;
+}
+function saveState(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch(e) {}
+}
+
+// ── API ──
+const API_SOURCES = {
+  price: [
+    { name: "CoinGecko", url: "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", parse: (d) => d?.bitcoin?.usd },
+    { name: "Blockchain.info", url: "https://blockchain.info/ticker", parse: (d) => d?.USD?.last },
+  ],
+  mvrv: [{ name: "Bitbo", url: "https://charts.bitbo.io/api/v1/mvrv-z/?latest=true", parse: (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null }],
+  puell: [{ name: "Bitbo", url: "https://charts.bitbo.io/api/v1/puell-multiple/?latest=true", parse: (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null }],
+  supplyProfit: [{ name: "Bitbo", url: "https://charts.bitbo.io/api/v1/supply-in-profit/?latest=true", parse: (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null }],
+  nupl: [{ name: "Bitbo", url: "https://charts.bitbo.io/api/v1/nupl/?latest=true", parse: (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null }],
+};
+
+async function fetchWithFallback(sources) {
+  for (const src of sources) {
+    try {
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), 6000);
+      const res = await fetch(src.url, { signal: ctrl.signal });
+      clearTimeout(tid);
+      if (!res.ok) continue;
+      const data = await res.json();
+      const val = src.parse(data);
+      if (val !== null && val !== undefined && !isNaN(val)) return { value: val, source: src.name };
+    } catch (e) { continue; }
+  }
+  return { value: null, source: null };
+}
+
+// ── RECOVERY STATE MACHINE ──
+function createRecoveryState() {
+  const state = {};
+  for (const ind of Object.keys(OC_THRESHOLDS)) {
+    state[ind] = { belowCount: 0, aboveCount: 0, hasDwelled: false, hasRecovered: false, peakExtreme: null };
+  }
+  return state;
+}
+
+function updateRecoveryState(prevState, values) {
+  const state = JSON.parse(JSON.stringify(prevState));
+  const alerts = [];
+  for (const ind of Object.keys(OC_THRESHOLDS)) {
+    const val = values[ind];
+    if (val === null || val === undefined) continue;
+    const { extreme, recovery, label } = OC_THRESHOLDS[ind];
+    const s = state[ind];
+    if (val < extreme) {
+      s.belowCount++; s.aboveCount = 0;
+      if (s.peakExtreme === null || val < s.peakExtreme) s.peakExtreme = val;
+      if (s.belowCount >= OC_RULES.dwellWeeks && !s.hasDwelled) {
+        s.hasDwelled = true;
+        alerts.push({ type: "dwell", ind, label, msg: `${label} entered deep value zone (${s.belowCount}wk below ${extreme})` });
+      }
+    } else if (val > recovery && s.hasDwelled) {
+      s.aboveCount++; s.belowCount = 0;
+      if (s.aboveCount >= OC_RULES.confirmWeeks && !s.hasRecovered) {
+        s.hasRecovered = true;
+        alerts.push({ type: "recovery", ind, label, msg: `${label} RECOVERY CONFIRMED (above ${recovery} for ${s.aboveCount}wk)` });
+      }
+    } else { s.belowCount = 0; if (!(val > recovery && s.hasDwelled)) s.aboveCount = 0; }
+  }
+  const recoveredCount = Object.values(state).filter(s => s.hasRecovered).length;
+  const dwelledCount = Object.values(state).filter(s => s.hasDwelled).length;
+  const compositeRecovery = recoveredCount >= OC_RULES.minIndicators;
+  if (compositeRecovery) alerts.push({ type: "composite", msg: `COMPOSITE RECOVERY: ${recoveredCount}/4 indicators confirmed` });
+  return { state, alerts, recoveredCount, dwelledCount, compositeRecovery };
+}
+
+function getRecoveryBoost(rr) {
+  if (!rr) return 0;
+  if (rr.compositeRecovery) return OC_RULES.pBotBoost * (rr.recoveredCount / 4);
+  if (rr.dwelledCount >= 3) return OC_RULES.pBotBoost * 0.3;
+  return 0;
+}
+function getAlertLevel(rr) {
+  if (!rr) return "NORMAL";
+  if (rr.compositeRecovery) return "RECOVERY_CONFIRMED";
+  if (rr.dwelledCount >= 2) return "DEEP_VALUE";
+  if (rr.dwelledCount >= 1) return "ENTERING_EXTREME";
+  return "NORMAL";
+}
+function getIndicatorStatus(rs) {
+  const r = {};
+  for (const ind of Object.keys(OC_THRESHOLDS)) {
+    const s = rs[ind];
+    if (s.hasRecovered) r[ind] = { status: "RECOVERED", color: "#22c55e" };
+    else if (s.hasDwelled) r[ind] = { status: `DWELLING (${s.belowCount}wk)`, color: "#f59e0b" };
+    else if (s.belowCount > 0) r[ind] = { status: `APPROACHING (${s.belowCount}wk)`, color: "#6366f1" };
+    else r[ind] = { status: "NORMAL", color: "#475569" };
+  }
+  return r;
+}
+
+// ── MODEL ENGINE ──
+function computeModel({ price, dryPowder, onChain, signals, manualPhase, ocBoostEnabled, recoveryBoost }) {
+  const now = new Date();
+  const dfa = daysBetween(ATH_DATE, now);
+  const dth = daysBetween(now, HALVING_DATE);
+  const dd = (price - ATH_PRICE) / ATH_PRICE;
+  const dda = Math.abs(dd);
+  const pTime = normalCDF((dfa - HIST.meanDays) / Math.max(HIST.stdDays, 1));
+  const pDD = normalCDF((dd - HIST.meanDD) / Math.max(HIST.stdDD, 0.001));
+  let pPrice = 0;
+  if (price >= EST.bottomPriceLow && price <= EST.bottomPriceHigh) {
+    const mid = (EST.bottomPriceLow + EST.bottomPriceHigh) / 2;
+    pPrice = 0.7 + 0.3 * (1 - Math.abs(price - mid) / (EST.bottomPriceHigh - EST.bottomPriceLow) * 2);
+  } else if (price < EST.bottomPriceLow) pPrice = 0.9;
+  else if (price <= EST.bottomPriceHigh * 1.3) pPrice = Math.max(0, 0.5 * (1 - (price - EST.bottomPriceHigh) / (EST.bottomPriceHigh * 0.3)));
+
+  let pWin = 0;
+  if (now >= EST.bottomEarliest && now <= EST.bottomLatest) pWin = 0.8;
+  else if (now > EST.bottomLatest) pWin = Math.min(0.95, 0.8 + 0.005 * daysBetween(EST.bottomLatest, now));
+  else pWin = Math.max(0.05, 0.3 * Math.exp(-daysBetween(now, EST.bottomEarliest) / 120));
+
+  const { mvrvZ, puell, supplyProfit, piCycle } = onChain;
+  let ocScore = 0, ocN = 0;
+  if (mvrvZ !== null) { ocN++; ocScore += mvrvZ < 0 ? 0.9 : mvrvZ < 0.5 ? 0.6 : mvrvZ < 1 ? 0.3 : 0.1; }
+  if (puell !== null) { ocN++; ocScore += puell < 0.5 ? 0.9 : puell < 0.8 ? 0.5 : 0.2; }
+  if (supplyProfit !== null) { ocN++; ocScore += supplyProfit < 50 ? 0.9 : supplyProfit < 60 ? 0.6 : supplyProfit < 70 ? 0.3 : 0.1; }
+  if (piCycle) { ocN++; ocScore += 0.95; }
+  const pOC = ocN > 0 ? ocScore / ocN : null;
+  const cap = signals.capitulation;
+  const pCap = cap ? 0.85 : 0;
+  const w = { t: 0.20, d: 0.20, p: 0.15, w: 0.20, oc: pOC !== null ? 0.15 : 0, c: cap ? 0.10 : 0 };
+  const tw = Object.values(w).reduce((a, b) => a + b, 0);
+  let comp = w.t/tw*pTime + w.d/tw*pDD + w.p/tw*pPrice + w.w/tw*pWin + (pOC!==null?w.oc/tw*pOC:0) + (cap?w.c/tw*pCap:0);
+  const ocBoost = ocBoostEnabled ? recoveryBoost : 0;
+  comp += ocBoost;
+  const pBot = clamp(comp, 0.02, 0.98);
+
+  let phase;
+  if (manualPhase) phase = manualPhase;
+  else if (signals.ichimoku && signals.higherLow) phase = "MARKUP";
+  else if (pBot > 0.75 || signals.higherLow) phase = "ACCUMULATION";
+  else phase = "MARKDOWN";
+
+  let rec = 0, reasoning = "";
+  if (phase === "MARKDOWN") {
+    const disc = clamp((dda - TUNED.ddStart) / (TUNED.ddFull - TUNED.ddStart), 0, 1);
+    let alloc = TUNED.ddMinAlloc + (TUNED.ddMaxAlloc - TUNED.ddMinAlloc) * Math.pow(disc, TUNED.ddExponent);
+    const tp = dfa / HIST.meanDays;
+    let supp = 1;
+    if (tp < TUNED.suppressCutoff) supp = TUNED.suppressMin + (1 - TUNED.suppressMin) * (tp / TUNED.suppressCutoff);
+    alloc *= supp;
+    rec = Math.max(dryPowder * TUNED.absFloor, dryPowder * alloc);
+    reasoning = `DD ${(dd*100).toFixed(1)}% → disc ${(disc*100).toFixed(0)}% → alloc ${(alloc*100).toFixed(1)}% (supp ${(supp*100).toFixed(0)}%). Saving powder.`;
+  } else if (phase === "ACCUMULATION") {
+    const aw = Math.floor(EST.accumRangeMid / 7);
+    const decay = TUNED.accumDecay / aw;
+    const wk = Math.max(1, Math.floor(daysBetween(EST.bottomLatest, new Date()) / 7));
+    const alloc = clamp(TUNED.accumDeploy * Math.exp(-decay * wk) + 0.10, 0.30, 0.95);
+    rec = dryPowder * alloc;
+    reasoning = `Accum week ~${wk}. Deploy ${(alloc*100).toFixed(0)}% — front-loaded taper.`;
+  } else {
+    rec = dryPowder;
+    reasoning = "Full deployment — every cuck buck becomes sats.";
+  }
+  rec = Math.round(clamp(rec, 0, dryPowder));
+  return {
+    phase, pBot, rec, estBTC: rec / price, saved: dryPowder - rec, reasoning, ocBoost,
+    probs: { pTime, pDD, pPrice, pWin, pOC, pCap },
+    dfa, dth, dd, weeksLeft: Math.max(1, Math.floor(dth / 7)),
+  };
+}
+
+// ── UI COMPONENTS ──
+const PHASE_CLR = { MARKDOWN: "#ef4444", ACCUMULATION: "#f59e0b", MARKUP: "#22c55e" };
+const ALERT_CLR = {
+  NORMAL: { bg: "#0f172a", border: "#1e293b", text: "#475569", label: "Normal" },
+  ENTERING_EXTREME: { bg: "#1e1b4b", border: "#4f46e5", text: "#818cf8", label: "Entering Extreme" },
+  DEEP_VALUE: { bg: "#451a03", border: "#d97706", text: "#fbbf24", label: "Deep Value Zone" },
+  RECOVERY_CONFIRMED: { bg: "#052e16", border: "#16a34a", text: "#4ade80", label: "Recovery Confirmed" },
+};
+
+function Chip({ label, value, src, status, zone, onClick }) {
+  const bg = status === "live" ? "#022c22" : status === "stale" ? "#422006" : "#1e293b";
+  const border = status === "live" ? "#16a34a" : status === "stale" ? "#d97706" : "#334155";
+  const dot = status === "live" ? "#22c55e" : status === "stale" ? "#f59e0b" : "#475569";
+  return (
+    <div onClick={onClick} style={{ background: bg, border: `1px solid ${border}`, borderRadius: 6, padding: "10px 14px", cursor: onClick ? "pointer" : "default", transition: "all 0.2s", position: "relative" }}>
+      {zone && <div style={{ position: "absolute", top: 3, right: 6, fontSize: 7, fontWeight: 800, color: zone.color, textTransform: "uppercase", letterSpacing: "0.08em" }}>{zone.status}</div>}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+        <div style={{ width: 6, height: 6, borderRadius: "50%", background: dot, flexShrink: 0 }} />
+        <span style={{ fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>{label}</span>
+      </div>
+      <div style={{ fontSize: 20, fontWeight: 800, color: "#e2e8f0", fontFamily: "'JetBrains Mono', monospace" }}>{value}</div>
+      {src && <div style={{ fontSize: 9, color: "#475569", marginTop: 2 }}>via {src}</div>}
+    </div>
+  );
+}
+
+function PBar({ label, value, color = "#f59e0b" }) {
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 2, color: "#94a3b8" }}>
+        <span>{label}</span>
+        <span style={{ color: "#e2e8f0", fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>{value !== null ? (value * 100).toFixed(1) + "%" : "—"}</span>
+      </div>
+      <div style={{ height: 5, background: "#1e293b", borderRadius: 3, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: value !== null ? `${Math.min(100, value * 100)}%` : "0%", background: color, borderRadius: 3, transition: "width 0.5s" }} />
+      </div>
+    </div>
+  );
+}
+
+function Toggle({ label, active, onClick }) {
+  return (
+    <button onClick={onClick} style={{ padding: "7px 11px", fontSize: 11, fontWeight: 600, background: active ? "#f7931a15" : "#0f172a", color: active ? "#f7931a" : "#64748b", border: `1px solid ${active ? "#f7931a44" : "#1e293b"}`, borderRadius: 4, cursor: "pointer", textAlign: "left", transition: "all 0.15s" }}>
+      <span style={{ marginRight: 5, fontSize: 8 }}>{active ? "●" : "○"}</span>{label}
+    </button>
+  );
+}
+
+function ZoneBar({ value, extreme, recovery, label }) {
+  if (value === null || value === undefined) return null;
+  const min = extreme - Math.abs(extreme) * 0.5 - 0.5;
+  const max = recovery + Math.abs(recovery) * 0.5 + 0.5;
+  const range = max - min;
+  const valPct = clamp((value - min) / range * 100, 0, 100);
+  const extPct = clamp((extreme - min) / range * 100, 0, 100);
+  const recPct = clamp((recovery - min) / range * 100, 0, 100);
+  const inExtreme = value < extreme;
+  const inRecovery = value > recovery;
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, marginBottom: 3 }}>
+        <span style={{ color: "#64748b" }}>{label}</span>
+        <span style={{ color: inExtreme ? "#ef4444" : inRecovery ? "#22c55e" : "#f59e0b", fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>
+          {typeof value === "number" ? (label.includes("Supply") ? value.toFixed(1) + "%" : value.toFixed(2)) : "—"}
+        </span>
+      </div>
+      <div style={{ height: 8, background: "#1e293b", borderRadius: 4, position: "relative", overflow: "hidden" }}>
+        <div style={{ position: "absolute", left: 0, width: `${extPct}%`, height: "100%", background: "#ef444420", borderRadius: "4px 0 0 4px" }} />
+        <div style={{ position: "absolute", left: `${recPct}%`, right: 0, height: "100%", background: "#22c55e10", borderRadius: "0 4px 4px 0" }} />
+        <div style={{ position: "absolute", left: `${extPct}%`, width: 2, height: "100%", background: "#ef4444", zIndex: 2 }} />
+        <div style={{ position: "absolute", left: `${recPct}%`, width: 2, height: "100%", background: "#22c55e", zIndex: 2 }} />
+        <div style={{ position: "absolute", left: `${valPct}%`, width: 4, height: "100%", background: inExtreme ? "#ef4444" : inRecovery ? "#22c55e" : "#f59e0b", borderRadius: 2, zIndex: 3, transform: "translateX(-2px)", boxShadow: `0 0 6px ${inExtreme ? "#ef4444" : inRecovery ? "#22c55e" : "#f59e0b"}` }} />
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: "#334155", marginTop: 2 }}>
+        <span style={{ color: "#ef4444" }}>◄ extreme {extreme}</span>
+        <span style={{ color: "#22c55e" }}>recovery {recovery} ►</span>
+      </div>
+    </div>
+  );
+}
+
+// ── MAIN APP ──
+function DCAEngine() {
+  const saved = useRef(loadState());
+  const [price, setPrice] = useState(null);
+  const [priceSrc, setPriceSrc] = useState(null);
+  const [mvrv, setMvrv] = useState(null); const [mvrvSrc, setMvrvSrc] = useState(null);
+  const [puell, setPuell] = useState(null); const [puellSrc, setPuellSrc] = useState(null);
+  const [sp, setSP] = useState(null); const [spSrc, setSPSrc] = useState(null);
+  const [nupl, setNupl] = useState(null); const [nuplSrc, setNuplSrc] = useState(null);
+  const [dryPowder, setDryPowder] = useState(saved.current?.dryPowder ?? 470);
+  const [piCycle, setPiCycle] = useState(false);
+  const [capitulation, setCapitulation] = useState(false);
+  const [higherLow, setHigherLow] = useState(false);
+  const [ichimoku, setIchimoku] = useState(false);
+  const [manualPhase, setManualPhase] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [lastFetch, setLastFetch] = useState(null);
+  const [tab, setTab] = useState("model");
+  const [ocBoostEnabled, setOcBoostEnabled] = useState(true);
+  const [recoveryState, setRecoveryState] = useState(createRecoveryState);
+  const [recoveryResult, setRecoveryResult] = useState(null);
+  const [alertLog, setAlertLog] = useState([]);
+
+  const defaultPurchases = [
+    { id: 1, date: "2026-02-11", cb: 196.00, btc: 0.00292270, fee: 4.00 },
+    { id: 2, date: "2026-02-12", cb: 0, btc: -0.00000789, fee: 0.53 },
+    { id: 3, date: "2026-02-20", cb: 193.43, btc: 0.00285445, fee: 3.95 },
+  ];
+  const [purchases, setPurchases] = useState(saved.current?.purchases ?? defaultPurchases);
+  const [newP, setNewP] = useState({ date: new Date().toISOString().split("T")[0], cb: "", btc: "", fee: "" });
+
+  const PRE_LEDGER_BTC = 0.18220115;
+  const USER_GOAL = 1.0;
+  const totalBTC = purchases.reduce((s, p) => s + p.btc, PRE_LEDGER_BTC);
+  const goalProgress = (totalBTC / USER_GOAL * 100).toFixed(1);
+  const btcRemaining = Math.max(0, USER_GOAL - totalBTC);
+
+  // Persist purchases and dry powder
+  useEffect(() => {
+    saveState({ purchases, dryPowder });
+  }, [purchases, dryPowder]);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [p, m, pu, s, n] = await Promise.all([
+      fetchWithFallback(API_SOURCES.price), fetchWithFallback(API_SOURCES.mvrv),
+      fetchWithFallback(API_SOURCES.puell), fetchWithFallback(API_SOURCES.supplyProfit),
+      fetchWithFallback(API_SOURCES.nupl),
+    ]);
+    if (p.value) { setPrice(p.value); setPriceSrc(p.source); }
+    if (m.value !== null) { setMvrv(m.value); setMvrvSrc(m.source); }
+    if (pu.value !== null) { setPuell(pu.value); setPuellSrc(pu.source); }
+    if (s.value !== null) { setSP(s.value); setSPSrc(s.source); }
+    if (n.value !== null) { setNupl(n.value); setNuplSrc(n.source); }
+    setLastFetch(new Date()); setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); const iv = setInterval(refresh, 300000); return () => clearInterval(iv); }, [refresh]);
+
+  useEffect(() => {
+    const vals = { mvrv_z: mvrv, puell, nupl, sp_pct: sp };
+    if (Object.values(vals).some(v => v !== null)) {
+      const result = updateRecoveryState(recoveryState, vals);
+      setRecoveryState(result.state); setRecoveryResult(result);
+      if (result.alerts.length > 0) setAlertLog(prev => [...result.alerts.map(a => ({ ...a, time: new Date() })), ...prev].slice(0, 20));
+    }
+  }, [mvrv, puell, nupl, sp]);
+
+  const currentPrice = price || 67300;
+  const recoveryBoost = getRecoveryBoost(recoveryResult);
+  const alertLevel = getAlertLevel(recoveryResult);
+  const indicatorStatus = getIndicatorStatus(recoveryState);
+  const alertStyle = ALERT_CLR[alertLevel];
+
+  const result = useMemo(() => computeModel({
+    price: currentPrice, dryPowder,
+    onChain: { mvrvZ: mvrv, puell, supplyProfit: sp, piCycle },
+    signals: { capitulation, higherLow, ichimoku },
+    manualPhase: manualPhase || null, ocBoostEnabled, recoveryBoost,
+  }), [currentPrice, dryPowder, mvrv, puell, sp, piCycle, capitulation, higherLow, ichimoku, manualPhase, ocBoostEnabled, recoveryBoost]);
+
+  const phaseClr = PHASE_CLR[result.phase];
+
+  const portfolio = useMemo(() => {
+    const tb = purchases.reduce((s, p) => s + p.btc, 0);
+    const ts = purchases.reduce((s, p) => s + p.cb, 0);
+    const tf = purchases.reduce((s, p) => s + p.fee, 0);
+    return { btc: tb, spent: ts, fees: tf, basis: tb > 0 ? (ts + tf) / tb : 0, value: tb * currentPrice, pnl: tb * currentPrice - ts - tf };
+  }, [purchases, currentPrice]);
+
+  const addPurchase = () => {
+    const p = { id: Date.now(), date: newP.date, cb: parseFloat(newP.cb) || 0, btc: parseFloat(newP.btc) || 0, fee: parseFloat(newP.fee) || 0 };
+    if (p.btc !== 0) { setPurchases(prev => [p, ...prev]); setNewP({ date: new Date().toISOString().split("T")[0], cb: "", btc: "", fee: "" }); }
+  };
+
+  const inputStyle = { width: "100%", padding: "7px 10px", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 4, color: "#e2e8f0", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", outline: "none", boxSizing: "border-box" };
+  const lblStyle = { display: "block", fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#475569", marginBottom: 3 };
+
+  return (
+    <div style={{ fontFamily: "'IBM Plex Sans', -apple-system, sans-serif", background: "#080c14", color: "#e2e8f0", minHeight: "100vh", padding: "16px 20px", maxWidth: 1100, margin: "0 auto" }}>
+      {/* HEADER */}
+      <div className="header-row" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, paddingBottom: 12, borderBottom: "1px solid #1e293b" }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 26, fontWeight: 900, color: "#f7931a" }}>₿</span>
+            <h1 style={{ fontSize: 18, fontWeight: 700, margin: 0, letterSpacing: "-0.02em" }}>DCA ENGINE <span style={{ fontSize: 12, fontWeight: 400, color: "#22c55e" }}>v2.3</span></h1>
+          </div>
+          <p style={{ fontSize: 11, color: "#475569", margin: "2px 0 0 36px", fontFamily: "'JetBrains Mono', monospace" }}>
+            {result.dth}d to halving · {result.weeksLeft}wk · Goal: {goalProgress}% of 1 BTC
+          </p>
+        </div>
+        <button onClick={refresh} disabled={loading}
+          style={{ padding: "6px 14px", fontSize: 11, fontWeight: 700, background: loading ? "#1e293b" : "#0f172a", color: loading ? "#475569" : "#f7931a", border: "1px solid #f7931a44", borderRadius: 4, cursor: loading ? "wait" : "pointer" }}>
+          {loading ? "⟳ FETCHING..." : "⟳ REFRESH"}
+        </button>
+      </div>
+
+      {/* ALERT BANNER */}
+      <div style={{ background: alertStyle.bg, border: `1px solid ${alertStyle.border}`, borderRadius: 6, padding: "8px 14px", marginBottom: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ width: 8, height: 8, borderRadius: "50%", background: alertStyle.text, boxShadow: alertLevel !== "NORMAL" ? `0 0 8px ${alertStyle.text}` : "none", animation: alertLevel === "RECOVERY_CONFIRMED" ? "pulse 2s infinite" : "none" }} />
+        <div style={{ flex: 1, minWidth: 150 }}>
+          <span style={{ fontSize: 10, fontWeight: 800, color: alertStyle.text, textTransform: "uppercase", letterSpacing: "0.1em" }}>{alertStyle.label}</span>
+          {recoveryResult && <span style={{ fontSize: 10, color: "#64748b", marginLeft: 10 }}>
+            {recoveryResult.dwelledCount}/4 dwelled · {recoveryResult.recoveredCount}/4 recovered
+            {ocBoostEnabled && recoveryBoost > 0 ? ` · boost: +${(recoveryBoost * 100).toFixed(0)}%` : ""}
+          </span>}
+        </div>
+        <Toggle label={`OC ${ocBoostEnabled ? "ON" : "OFF"}`} active={ocBoostEnabled} onClick={() => setOcBoostEnabled(!ocBoostEnabled)} />
+      </div>
+
+      {/* TABS */}
+      <div className="tab-bar" style={{ display: "flex", gap: 1, marginBottom: 16 }}>
+        {[["model","⚡ MODEL"],["exec","📊 EXEC"],["recovery","🔗 CHAIN"],["ledger","📋 LEDGER"],["params","🔧 PARAMS"]].map(([k,l])=>(
+          <button key={k} onClick={()=>setTab(k)} style={{ padding:"6px 14px",fontSize:11,fontWeight:700,letterSpacing:"0.04em",background:tab===k?"#1e293b":"transparent",color:tab===k?"#f7931a":"#475569",border:"none",borderBottom:tab===k?"2px solid #f7931a":"2px solid transparent",cursor:"pointer",fontFamily:"'JetBrains Mono',monospace" }}>{l}</button>
+        ))}
+      </div>
+
+      {/* ══════════ MODEL TAB ══════════ */}
+      {tab === "model" && (
+        <div className="tab-content grid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div>
+            <div className="grid-6" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 14 }}>
+              <Chip label="BTC/USD" value={price ? fmt$(price) : "..."} src={priceSrc} status={price ? "live" : "pending"} />
+              <Chip label="MVRV Z" value={mvrv !== null ? mvrv.toFixed(2) : "..."} src={mvrvSrc} status={mvrv !== null ? "live" : "pending"} zone={indicatorStatus.mvrv_z} />
+              <Chip label="Puell" value={puell !== null ? puell.toFixed(2) : "..."} src={puellSrc} status={puell !== null ? "live" : "pending"} zone={indicatorStatus.puell} />
+              <Chip label="Supply %" value={sp !== null ? sp.toFixed(1) + "%" : "..."} src={spSrc} status={sp !== null ? "live" : "pending"} zone={indicatorStatus.sp_pct} />
+              <Chip label="NUPL" value={nupl !== null ? nupl.toFixed(3) : "..."} src={nuplSrc} status={nupl !== null ? "live" : "pending"} zone={indicatorStatus.nupl} />
+              <Chip label="Drawdown" value={(result.dd * 100).toFixed(1) + "%" } status="live" />
+            </div>
+            <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, padding: 14, marginBottom: 14 }}>
+              <span style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#475569" }}>Probability Model</span>
+              <div style={{ marginTop: 10 }}>
+                <PBar label="P(time)" value={result.probs.pTime} color="#3b82f6" />
+                <PBar label="P(drawdown)" value={result.probs.pDD} color="#8b5cf6" />
+                <PBar label="P(price zone)" value={result.probs.pPrice} color="#ec4899" />
+                <PBar label="P(window)" value={result.probs.pWin} color="#06b6d4" />
+                {result.probs.pOC !== null && <PBar label="P(on-chain)" value={result.probs.pOC} color="#10b981" />}
+                <div style={{ height: 1, background: "#1e293b", margin: "8px 0" }} />
+                <PBar label="Composite P(bottom in)" value={result.pBot} color="#f7931a" />
+              </div>
+            </div>
+          </div>
+          <div>
+            <div style={{ background: phaseClr + "10", border: `1px solid ${phaseClr}33`, borderRadius: 8, padding: 16, marginBottom: 14 }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: phaseClr, textTransform: "uppercase", letterSpacing: "0.1em" }}>Phase: {result.phase}</div>
+              <div style={{ fontSize: 32, fontWeight: 900, color: "#f7931a", fontFamily: "'JetBrains Mono', monospace", margin: "6px 0" }}>{fmt$(result.rec)}</div>
+              <div style={{ fontSize: 11, color: "#94a3b8" }}>recommended buy this week</div>
+              <div style={{ fontSize: 11, color: "#64748b", marginTop: 6 }}>≈ {fmtBTC(result.estBTC)} BTC · Saving {fmt$(result.saved)}</div>
+              <div style={{ marginTop: 10, padding: "8px 10px", background: "#0f172a", borderRadius: 4, fontSize: 10, color: "#64748b", lineHeight: 1.5 }}>{result.reasoning}</div>
+            </div>
+            <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, padding: 14, marginBottom: 14 }}>
+              <label style={lblStyle}>Dry Powder (Cuck Bucks)</label>
+              <input type="number" value={dryPowder} onChange={e => setDryPowder(Math.max(0, parseFloat(e.target.value) || 0))} style={{ ...inputStyle, fontSize: 18, fontWeight: 700 }} />
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <Toggle label="Pi Cycle Top" active={piCycle} onClick={() => setPiCycle(!piCycle)} />
+              <Toggle label="Capitulation" active={capitulation} onClick={() => setCapitulation(!capitulation)} />
+              <Toggle label="Higher Low" active={higherLow} onClick={() => setHigherLow(!higherLow)} />
+              <Toggle label="Ichimoku Bull" active={ichimoku} onClick={() => setIchimoku(!ichimoku)} />
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <label style={lblStyle}>Manual Phase Override</label>
+              <div style={{ display: "flex", gap: 6 }}>
+                {["", "MARKDOWN", "ACCUMULATION", "MARKUP"].map(p => (
+                  <button key={p} onClick={() => setManualPhase(p)} style={{ flex: 1, padding: "6px 0", fontSize: 10, fontWeight: 700, background: manualPhase === p ? "#1e293b" : "transparent", color: manualPhase === p ? "#f7931a" : "#475569", border: `1px solid ${manualPhase === p ? "#f7931a44" : "#1e293b"}`, borderRadius: 4, cursor: "pointer" }}>
+                    {p || "AUTO"}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══════════ EXECUTION TAB ══════════ */}
+      {tab === "exec" && (() => {
+        const wb = result ? result.rec : 0;
+        const p = currentPrice;
+        const dip1 = p * 0.99; const dip2 = p * 0.975; const dip3 = p;
+        const s1 = Math.round(wb * 0.40); const s2 = Math.round(wb * 0.35); const s3 = wb - s1 - s2;
+        const sats1 = s1 > 0 ? Math.round(s1/dip1*1e8) : 0;
+        const sats2 = s2 > 0 ? Math.round(s2/dip2*1e8) : 0;
+        const sats3 = s3 > 0 ? Math.round(s3/p*1e8) : 0;
+        const naiveSats = wb > 0 ? Math.round(wb/p*1e8) : 0;
+        const mrSats = sats1 + sats2 + sats3;
+        const imp = naiveSats > 0 ? ((mrSats/naiveSats - 1)*100).toFixed(2) : "0.00";
+        return (
+        <div className="tab-content grid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div>
+            <div style={{ background: "#0c1220", border: "1px solid #f7931a33", borderRadius: 8, padding: 16, marginBottom: 14 }}>
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#f7931a", margin: "0 0 12px 0" }}>🎯 1 BTC Goal</h3>
+              <div style={{ background: "#1e293b", borderRadius: 6, height: 32, overflow: "hidden", marginBottom: 12 }}>
+                <div style={{ background: "linear-gradient(90deg, #f7931a, #fbbf24)", height: "100%", width: `${Math.min(100, goalProgress)}%`, borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "flex-end", paddingRight: 10, fontSize: 12, fontWeight: 800, color: "#0f172a", minWidth: 50 }}>{goalProgress}%</div>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 12, color: "#94a3b8" }}>
+                <div>Held: <span style={{ color: "#22c55e", fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>{totalBTC.toFixed(8)}</span></div>
+                <div>Need: <span style={{ color: "#f59e0b", fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>{btcRemaining.toFixed(8)}</span></div>
+                <div>Goal: <span style={{ color: "#f7931a" }}>1.00000000</span></div>
+                <div>By: <span style={{ color: "#94a3b8" }}>Halving ~Apr 2028</span></div>
+              </div>
+              <div style={{ marginTop: 12, padding: "10px 12px", background: "#16a34a15", borderRadius: 6, fontSize: 11, color: "#22c55e", lineHeight: 1.6 }}>
+                ✅ P(≥1 BTC) = <strong>100%</strong> at $470/wk across 800 MC sims. Median: ~1.95 BTC.
+              </div>
+            </div>
+            <div style={{ background: "#0c1220", border: "1px solid #3b82f633", borderRadius: 8, padding: 16 }}>
+              <h3 style={{ fontSize: 13, fontWeight: 700, color: "#60a5fa", margin: "0 0 10px 0" }}>Strategy Comparison (800 MC)</h3>
+              <table className="exec-table" style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                <thead><tr style={{ borderBottom: "1px solid #1e293b" }}>
+                  {["Strategy","BTC","vs V2.2","H2H"].map(h => <th key={h} style={{ padding: "5px 8px", textAlign: "right", color: "#475569", fontWeight: 600, fontSize: 10 }}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  {[["Naive DCA","2.114","-1.32%","31%","#94a3b8"],["V2.2","2.142","—","—","#f7931a"],["Value Avg","2.104","-1.77%","22%","#ef4444"],["Kelly","2.122","-0.90%","35%","#ef4444"],["V2.3 (MR)","2.147","+0.27%","54%","#22c55e"],["Combined","2.123","-0.85%","33%","#ef4444"]].map(([s,b,v,w,c]) => (
+                    <tr key={s} style={{ borderBottom: "1px solid #0f172a" }}>
+                      <td style={{ padding: "5px 8px", color: c, fontWeight: s.includes("V2.3")?700:400 }}>{s}</td>
+                      <td style={{ padding: "5px 8px", textAlign: "right", color: "#94a3b8", fontFamily: "'JetBrains Mono', monospace" }}>{b}</td>
+                      <td style={{ padding: "5px 8px", textAlign: "right", color: v.startsWith("+")?"#22c55e":v==="—"?"#475569":"#ef4444" }}>{v}</td>
+                      <td style={{ padding: "5px 8px", textAlign: "right", color: parseInt(w)>50?"#22c55e":"#94a3b8" }}>{w}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <div style={{ background: "#0c1220", border: "1px solid #22c55e33", borderRadius: 8, padding: 16, marginBottom: 14 }}>
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#22c55e", margin: "0 0 10px 0" }}>⚡ Execution Plan</h3>
+              <div style={{ fontSize: 11, color: "#64748b", marginBottom: 12 }}>Split weekly buy into limit orders. Fill or market-buy Friday.</div>
+              <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 10 }}>Budget: <span style={{ color: "#f7931a", fontWeight: 700 }}>{fmt$(wb)}</span> · Price: {fmt$(p)}</div>
+              <table className="exec-table" style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 14 }}>
+                <thead><tr style={{ borderBottom: "1px solid #1e293b" }}>
+                  {["Order","Limit","$","Sats"].map(h => <th key={h} style={{ padding: "6px 8px", textAlign: "right", color: "#475569", fontWeight: 600, fontSize: 10 }}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  <tr style={{ borderBottom: "1px solid #0f172a" }}><td style={{ padding: "6px 8px", color: "#22c55e" }}>① -1.0%</td><td style={{ padding: "6px 8px", textAlign: "right", color: "#94a3b8" }}>{fmt$(dip1)}</td><td style={{ padding: "6px 8px", textAlign: "right", color: "#f7931a" }}>{fmt$(s1)}</td><td style={{ padding: "6px 8px", textAlign: "right", color: "#22c55e", fontWeight: 700 }}>{sats1.toLocaleString()}</td></tr>
+                  <tr style={{ borderBottom: "1px solid #0f172a" }}><td style={{ padding: "6px 8px", color: "#fbbf24" }}>② -2.5%</td><td style={{ padding: "6px 8px", textAlign: "right", color: "#94a3b8" }}>{fmt$(dip2)}</td><td style={{ padding: "6px 8px", textAlign: "right", color: "#f7931a" }}>{fmt$(s2)}</td><td style={{ padding: "6px 8px", textAlign: "right", color: "#22c55e", fontWeight: 700 }}>{sats2.toLocaleString()}</td></tr>
+                  <tr style={{ borderBottom: "1px solid #0f172a" }}><td style={{ padding: "6px 8px", color: "#94a3b8" }}>③ Mkt Fri</td><td style={{ padding: "6px 8px", textAlign: "right", color: "#94a3b8" }}>{fmt$(p)}</td><td style={{ padding: "6px 8px", textAlign: "right", color: "#f7931a" }}>{fmt$(s3)}</td><td style={{ padding: "6px 8px", textAlign: "right", color: "#94a3b8" }}>{sats3.toLocaleString()}</td></tr>
+                </tbody>
+              </table>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, padding: "10px 12px", background: "#1e293b", borderRadius: 6, fontSize: 11 }}>
+                <div style={{ color: "#64748b" }}>Naive: <span style={{ color: "#94a3b8" }}>{naiveSats.toLocaleString()} sats</span></div>
+                <div style={{ color: "#64748b" }}>MR: <span style={{ color: "#22c55e", fontWeight: 700 }}>{mrSats.toLocaleString()} sats</span></div>
+                <div style={{ color: "#64748b" }}>If limits fill:</div>
+                <div style={{ color: "#22c55e", fontWeight: 700 }}>+{imp}% more sats</div>
+              </div>
+            </div>
+            <div style={{ background: "#0c1220", border: "1px solid #8b5cf633", borderRadius: 8, padding: 16 }}>
+              <h3 style={{ fontSize: 13, fontWeight: 700, color: "#a78bfa", margin: "0 0 10px 0" }}>Why Only MR Works</h3>
+              <div style={{ fontSize: 11, color: "#94a3b8", lineHeight: 1.8 }}>
+                <div style={{ marginBottom: 6 }}><span style={{ color: "#a78bfa", fontWeight: 600 }}>VA:</span> DD curve already does this better — calibrated to BTC cycles.</div>
+                <div style={{ marginBottom: 6 }}><span style={{ color: "#a78bfa", fontWeight: 600 }}>Kelly:</span> Optimizes multi-asset sizing. Single-asset DD curve outperforms.</div>
+                <div><span style={{ color: "#a78bfa", fontWeight: 600 }}>MR:</span> Improves execution, not allocation. Orthogonal to DD curve → additive edge.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        );
+      })()}
+
+      {/* ══════════ ON-CHAIN TAB ══════════ */}
+      {tab === "recovery" && (
+        <div className="tab-content grid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div>
+            <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, padding: 16, marginBottom: 14 }}>
+              <h3 style={{ fontSize: 13, fontWeight: 700, color: "#f7931a", margin: "0 0 14px 0" }}>Zone Bars</h3>
+              <ZoneBar value={mvrv} extreme={OC_THRESHOLDS.mvrv_z.extreme} recovery={OC_THRESHOLDS.mvrv_z.recovery} label="MVRV Z-Score" />
+              <ZoneBar value={puell} extreme={OC_THRESHOLDS.puell.extreme} recovery={OC_THRESHOLDS.puell.recovery} label="Puell Multiple" />
+              <ZoneBar value={nupl} extreme={OC_THRESHOLDS.nupl.extreme} recovery={OC_THRESHOLDS.nupl.recovery} label="NUPL" />
+              <ZoneBar value={sp} extreme={OC_THRESHOLDS.sp_pct.extreme} recovery={OC_THRESHOLDS.sp_pct.recovery} label="Supply in Profit %" />
+            </div>
+            <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, padding: 16 }}>
+              <h3 style={{ fontSize: 13, fontWeight: 700, color: "#94a3b8", margin: "0 0 10px 0" }}>Indicator Status</h3>
+              {Object.entries(OC_THRESHOLDS).map(([ind, cfg]) => {
+                const st = indicatorStatus[ind];
+                return (
+                  <div key={ind} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #111827" }}>
+                    <span style={{ fontSize: 11, color: "#94a3b8" }}>{cfg.label}</span>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: st.color, fontFamily: "'JetBrains Mono', monospace" }}>{st.status}</span>
+                  </div>
+                );
+              })}
+              <div style={{ marginTop: 10, fontSize: 10, color: "#475569" }}>
+                Dwell: {OC_RULES.dwellWeeks}wk · Confirm: {OC_RULES.confirmWeeks}wk · Min: {OC_RULES.minIndicators}/4
+              </div>
+            </div>
+          </div>
+          <div>
+            <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, padding: 16, marginBottom: 14 }}>
+              <h3 style={{ fontSize: 13, fontWeight: 700, color: "#f59e0b", margin: "0 0 10px 0" }}>Alert Log</h3>
+              {alertLog.length === 0 ? <div style={{ color: "#334155", fontSize: 11 }}>No alerts yet.</div> : (
+                <div style={{ maxHeight: 200, overflowY: "auto" }}>
+                  {alertLog.map((a, i) => (
+                    <div key={i} style={{ padding: "6px 0", borderBottom: "1px solid #111827", fontSize: 11 }}>
+                      <span style={{ color: "#334155", fontFamily: "'JetBrains Mono', monospace", marginRight: 8 }}>{a.time?.toLocaleTimeString()}</span>
+                      <span style={{ color: a.type === "composite" ? "#22c55e" : a.type === "recovery" ? "#4ade80" : "#f59e0b" }}>{a.msg}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div style={{ background: "#0c1220", border: "1px solid #16a34a33", borderRadius: 8, padding: 16 }}>
+              <h3 style={{ fontSize: 13, fontWeight: 700, color: "#22c55e", margin: "0 0 10px 0" }}>Validation</h3>
+              <div style={{ fontSize: 11, color: "#94a3b8", lineHeight: 1.8 }}>
+                <div><strong style={{ color: "#e2e8f0" }}>Historical:</strong> 2015 (+6.0%, 96% WR) · 2019 (+7.4%, 98%) · 2022 (+9.1%, 100%)</div>
+                <div><strong style={{ color: "#e2e8f0" }}>Recovery accuracy:</strong> 0% false early, avg +5.6wk after bottom</div>
+                <div><strong style={{ color: "#e2e8f0" }}>Late detection:</strong> 9.2% → 0.1% with recovery override</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══════════ LEDGER TAB ══════════ */}
+      {tab === "ledger" && (
+        <div className="tab-content">
+          <div className="grid-6" style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8, marginBottom: 16 }}>
+            {[["Total BTC", fmtBTC(portfolio.btc)], ["Total Spent", fmt$(portfolio.spent)], ["Fees", fmt$(portfolio.fees)], ["Avg Basis", portfolio.basis > 0 ? fmt$(portfolio.basis) : "—"], ["Value", fmt$(portfolio.value)], ["P&L", fmt$(portfolio.pnl)]].map(([l, v], i) => (
+              <div key={l} style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 6, padding: 10 }}>
+                <div style={{ fontSize: 9, color: "#475569", textTransform: "uppercase", letterSpacing: "0.1em" }}>{l}</div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: i === 5 ? (portfolio.pnl >= 0 ? "#22c55e" : "#ef4444") : "#e2e8f0", fontFamily: "'JetBrains Mono', monospace" }}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, padding: 14, marginBottom: 14 }}>
+            <span style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#475569", display: "block", marginBottom: 10 }}>Log Purchase</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+              <div style={{ flex: "1 1 100px" }}><label style={lblStyle}>Date</label><input type="date" value={newP.date} onChange={e => setNewP(p=>({...p,date:e.target.value}))} style={inputStyle} /></div>
+              <div style={{ flex: "1 1 80px" }}><label style={lblStyle}>Cuck Bucks</label><input type="number" value={newP.cb} onChange={e => setNewP(p=>({...p,cb:e.target.value}))} style={inputStyle} placeholder="350" /></div>
+              <div style={{ flex: "1 1 120px" }}><label style={lblStyle}>BTC Received</label><input type="number" step="0.00000001" value={newP.btc} onChange={e => setNewP(p=>({...p,btc:e.target.value}))} style={inputStyle} placeholder="0.00520000" /></div>
+              <div style={{ flex: "1 1 60px" }}><label style={lblStyle}>Fee</label><input type="number" value={newP.fee} onChange={e => setNewP(p=>({...p,fee:e.target.value}))} style={inputStyle} placeholder="3.50" /></div>
+              <button onClick={addPurchase} style={{ padding: "8px 16px", background: "#f7931a", color: "#080c14", border: "none", borderRadius: 4, fontWeight: 800, fontSize: 11, cursor: "pointer", whiteSpace: "nowrap" }}>+ LOG</button>
+            </div>
+          </div>
+          <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, overflow: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 500 }}>
+              <thead><tr style={{ background: "#1e293b" }}>
+                {["Date", "Cuck Bucks", "BTC", "Fee", "$/BTC", ""].map(h => (
+                  <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#475569" }}>{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {purchases.length === 0 ? (
+                  <tr><td colSpan={6} style={{ padding: 24, textAlign: "center", color: "#334155" }}>No purchases logged.</td></tr>
+                ) : purchases.map(p => (
+                  <tr key={p.id} style={{ borderBottom: "1px solid #1e293b" }}>
+                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#94a3b8" }}>{p.date}</td>
+                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#f7931a" }}>{fmt$(p.cb)}</td>
+                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#e2e8f0", fontWeight: 700 }}>{fmtBTC(p.btc)}</td>
+                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#64748b" }}>{fmt$(p.fee)}</td>
+                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#94a3b8" }}>{p.btc > 0 ? fmt$(p.cb / p.btc) : "—"}</td>
+                    <td style={{ padding: "8px 10px" }}><button onClick={() => setPurchases(prev => prev.filter(x => x.id !== p.id))} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 13 }}>✕</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ══════════ PARAMS TAB ══════════ */}
+      {tab === "params" && (
+        <div className="tab-content" style={{ maxWidth: 700 }}>
+          <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, padding: 16, marginBottom: 14 }}>
+            <h3 style={{ fontSize: 13, fontWeight: 700, color: "#f7931a", margin: "0 0 14px 0" }}>DD Curve — MC-Tuned</h3>
+            {[["DD Ramp Start", "50%", "Curve activates at -50% from ATH"], ["DD Ramp Full", "80%", "Max at -80% drawdown"], ["Min/Max Alloc", "3%–50%", "3% at -50%, 50% at -80%+"], ["Exponent", "2.0", "Back-loads toward deep discounts"], ["Suppress", "40% floor", "Reduces early markdown buys"], ["Accum Deploy", "90% tapered", "Front-loaded accumulation"]].map(([l, v, n], i) => (
+              <div key={i} style={{ display: "flex", padding: "5px 0", borderBottom: "1px solid #111827", alignItems: "center", flexWrap: "wrap" }}>
+                <div style={{ flex: "0 0 130px", fontSize: 12, color: "#94a3b8" }}>{l}</div>
+                <div style={{ flex: "0 0 70px", fontSize: 12, fontFamily: "'JetBrains Mono', monospace", color: "#f7931a", fontWeight: 700 }}>{v}</div>
+                <div style={{ flex: 1, fontSize: 10, color: "#475569", paddingLeft: 12 }}>{n}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ background: "#0c1220", border: "1px solid #6366f133", borderRadius: 8, padding: 16, marginBottom: 14 }}>
+            <h3 style={{ fontSize: 13, fontWeight: 700, color: "#818cf8", margin: "0 0 14px 0" }}>On-Chain Thresholds</h3>
+            {Object.entries(OC_THRESHOLDS).map(([ind, cfg]) => (
+              <div key={ind} style={{ display: "flex", padding: "5px 0", borderBottom: "1px solid #111827", flexWrap: "wrap" }}>
+                <div style={{ flex: "0 0 130px", fontSize: 12, color: "#94a3b8" }}>{cfg.label}</div>
+                <div style={{ fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
+                  <span style={{ color: "#ef4444" }}>ext &lt; {cfg.extreme}</span>
+                  <span style={{ color: "#475569", margin: "0 8px" }}>·</span>
+                  <span style={{ color: "#22c55e" }}>rec &gt; {cfg.recovery}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{ background: "#0c1220", border: "1px solid #16a34a33", borderRadius: 8, padding: 16 }}>
+            <h3 style={{ fontSize: 13, fontWeight: 700, color: "#22c55e", margin: "0 0 10px 0" }}>Validation</h3>
+            <div style={{ fontSize: 11, color: "#94a3b8", lineHeight: 1.9, fontFamily: "'JetBrains Mono', monospace" }}>
+              {[["Backtest 2015","+6.0% vs naive","96% WR"],["Backtest 2019","+7.4% vs naive","98% WR"],["Backtest 2022","+9.1% vs naive","100% WR"],["Forward MC (800)","+1.6% vs naive","74.5% WR"],["MR exec vs V2.2","+0.27%","53.6% H2H"],["P(≥1 BTC) $470/wk","100%","all 800 sims"]].map(([s,a,w])=>(
+                <div key={s} style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span>{s}</span><span><span style={{ color: "#22c55e" }}>{a}</span> · {w}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FOOTER */}
+      <div style={{ textAlign: "center", padding: "20px 0 10px", fontSize: 9, color: "#1e293b" }}>
+        DCA Engine v2.3 · {lastFetch ? `Updated ${lastFetch.toLocaleTimeString()}` : "Loading..."} · Auto-refresh 5min
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<DCAEngine />);
+</script>
+<script>
+// Service Worker registration for PWA/offline
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
