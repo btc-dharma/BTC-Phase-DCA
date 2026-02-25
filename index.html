@@ -43,6 +43,7 @@ input[type=number]{-moz-appearance:textfield}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script type="text/babel" data-type="module">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
@@ -98,15 +99,25 @@ function saveState(data) {
 }
 
 // ── API ──
+// CORS proxies to try (Bitbo API has no CORS headers)
+const CORS_PROXIES = [
+  (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+  (u) => "https://corsproxy.io/?" + encodeURIComponent(u),
+  (u) => u, // direct (in case Bitbo adds CORS later)
+];
+
+const BITBO_BASE = "https://charts.bitbo.io/api/v1";
+const parseBitbo = (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null;
+
 const API_SOURCES = {
   price: [
     { name: "CoinGecko", url: "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", parse: (d) => d?.bitcoin?.usd },
     { name: "Blockchain.info", url: "https://blockchain.info/ticker", parse: (d) => d?.USD?.last },
   ],
-  mvrv: [{ name: "Bitbo", url: "https://charts.bitbo.io/api/v1/mvrv-z/?latest=true", parse: (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null }],
-  puell: [{ name: "Bitbo", url: "https://charts.bitbo.io/api/v1/puell-multiple/?latest=true", parse: (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null }],
-  supplyProfit: [{ name: "Bitbo", url: "https://charts.bitbo.io/api/v1/supply-in-profit/?latest=true", parse: (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null }],
-  nupl: [{ name: "Bitbo", url: "https://charts.bitbo.io/api/v1/nupl/?latest=true", parse: (d) => d?.data?.[0]?.[1] ? parseFloat(d.data[0][1]) : null }],
+  mvrv: CORS_PROXIES.map(proxy => ({ name: "Bitbo", url: proxy(BITBO_BASE + "/mvrv-z/?latest=true"), parse: parseBitbo })),
+  puell: CORS_PROXIES.map(proxy => ({ name: "Bitbo", url: proxy(BITBO_BASE + "/puell-multiple/?latest=true"), parse: parseBitbo })),
+  supplyProfit: CORS_PROXIES.map(proxy => ({ name: "Bitbo", url: proxy(BITBO_BASE + "/supply-in-profit/?latest=true"), parse: parseBitbo })),
+  nupl: CORS_PROXIES.map(proxy => ({ name: "Bitbo", url: proxy(BITBO_BASE + "/nupl/?latest=true"), parse: parseBitbo })),
 };
 
 async function fetchWithFallback(sources) {
@@ -351,6 +362,8 @@ function DCAEngine() {
   const [puell, setPuell] = useState(null); const [puellSrc, setPuellSrc] = useState(null);
   const [sp, setSP] = useState(null); const [spSrc, setSPSrc] = useState(null);
   const [nupl, setNupl] = useState(null); const [nuplSrc, setNuplSrc] = useState(null);
+  const [ocManualMode, setOcManualMode] = useState(false);
+  const [ocFetchFailed, setOcFetchFailed] = useState(false);
   const [dryPowder, setDryPowder] = useState(saved.current?.dryPowder ?? 470);
   const [piCycle, setPiCycle] = useState(false);
   const [capitulation, setCapitulation] = useState(false);
@@ -396,6 +409,10 @@ function DCAEngine() {
     if (pu.value !== null) { setPuell(pu.value); setPuellSrc(pu.source); }
     if (s.value !== null) { setSP(s.value); setSPSrc(s.source); }
     if (n.value !== null) { setNupl(n.value); setNuplSrc(n.source); }
+    // Check if all on-chain fetches failed
+    if (m.value === null && pu.value === null && s.value === null && n.value === null) {
+      setOcFetchFailed(true);
+    }
     setLastFetch(new Date()); setLoading(false);
   }, []);
 
@@ -429,8 +446,8 @@ function DCAEngine() {
     const tb = purchases.reduce((s, p) => s + p.btc, 0);
     const ts = purchases.reduce((s, p) => s + p.cb, 0);
     const tf = purchases.reduce((s, p) => s + p.fee, 0);
-    return { btc: tb, spent: ts, fees: tf, basis: tb > 0 ? (ts + tf) / tb : 0, value: tb * currentPrice, pnl: tb * currentPrice - ts - tf };
-  }, [purchases, currentPrice]);
+    return { btc: tb, spent: ts, fees: tf, basis: tb > 0 ? (ts + tf) / tb : 0, value: totalBTC * currentPrice, pnl: totalBTC * currentPrice - ts - tf };
+  }, [purchases, currentPrice, totalBTC]);
 
   const addPurchase = () => {
     const p = { id: Date.now(), date: newP.date, cb: parseFloat(newP.cb) || 0, btc: parseFloat(newP.btc) || 0, fee: parseFloat(newP.fee) || 0 };
@@ -485,12 +502,46 @@ function DCAEngine() {
           <div>
             <div className="grid-6" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 14 }}>
               <Chip label="BTC/USD" value={price ? fmt$(price) : "..."} src={priceSrc} status={price ? "live" : "pending"} />
-              <Chip label="MVRV Z" value={mvrv !== null ? mvrv.toFixed(2) : "..."} src={mvrvSrc} status={mvrv !== null ? "live" : "pending"} zone={indicatorStatus.mvrv_z} />
-              <Chip label="Puell" value={puell !== null ? puell.toFixed(2) : "..."} src={puellSrc} status={puell !== null ? "live" : "pending"} zone={indicatorStatus.puell} />
-              <Chip label="Supply %" value={sp !== null ? sp.toFixed(1) + "%" : "..."} src={spSrc} status={sp !== null ? "live" : "pending"} zone={indicatorStatus.sp_pct} />
-              <Chip label="NUPL" value={nupl !== null ? nupl.toFixed(3) : "..."} src={nuplSrc} status={nupl !== null ? "live" : "pending"} zone={indicatorStatus.nupl} />
+              <Chip label="MVRV Z" value={mvrv !== null ? mvrv.toFixed(2) : "..."} src={mvrvSrc} status={mvrv !== null ? (mvrvSrc === "Manual" ? "stale" : "live") : "pending"} zone={indicatorStatus.mvrv_z} />
+              <Chip label="Puell" value={puell !== null ? puell.toFixed(2) : "..."} src={puellSrc} status={puell !== null ? (puellSrc === "Manual" ? "stale" : "live") : "pending"} zone={indicatorStatus.puell} />
+              <Chip label="Supply %" value={sp !== null ? sp.toFixed(1) + "%" : "..."} src={spSrc} status={sp !== null ? (spSrc === "Manual" ? "stale" : "live") : "pending"} zone={indicatorStatus.sp_pct} />
+              <Chip label="NUPL" value={nupl !== null ? nupl.toFixed(3) : "..."} src={nuplSrc} status={nupl !== null ? (nuplSrc === "Manual" ? "stale" : "live") : "pending"} zone={indicatorStatus.nupl} />
               <Chip label="Drawdown" value={(result.dd * 100).toFixed(1) + "%" } status="live" />
             </div>
+            {/* Manual OC input when auto-fetch fails */}
+            {(ocFetchFailed || ocManualMode) && (
+              <div style={{ background: "#0c1220", border: "1px solid #f59e0b33", borderRadius: 8, padding: 12, marginBottom: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <span style={{ fontSize: 10, fontWeight: 700, color: "#f59e0b", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                    {ocFetchFailed && !ocManualMode ? "⚠ On-chain APIs blocked (CORS) — enter manually" : "Manual On-Chain Input"}
+                  </span>
+                  <button onClick={() => { setOcManualMode(!ocManualMode); if (ocManualMode) setOcFetchFailed(false); }} style={{ fontSize: 9, padding: "3px 8px", background: "transparent", border: "1px solid #f59e0b44", color: "#f59e0b", borderRadius: 3, cursor: "pointer" }}>
+                    {ocManualMode ? "HIDE" : "MANUAL"}
+                  </button>
+                </div>
+                <div style={{ fontSize: 9, color: "#64748b", marginBottom: 10 }}>
+                  Get values from <a href="https://charts.bitbo.io/mvrv-z-score/" target="_blank" rel="noopener" style={{ color: "#60a5fa" }}>bitbo.io</a> or <a href="https://www.bitcoinmagazinepro.com/charts/mvrv-zscore/" target="_blank" rel="noopener" style={{ color: "#60a5fa" }}>bitcoinmagazinepro.com</a>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
+                  {[
+                    ["MVRV Z", mvrv, (v) => { setMvrv(v); setMvrvSrc("Manual"); }, "e.g. 1.85"],
+                    ["Puell", puell, (v) => { setPuell(v); setPuellSrc("Manual"); }, "e.g. 1.20"],
+                    ["Supply %", sp, (v) => { setSP(v); setSPSrc("Manual"); }, "e.g. 76"],
+                    ["NUPL", nupl, (v) => { setNupl(v); setNuplSrc("Manual"); }, "e.g. 0.45"],
+                  ].map(([label, val, setter, ph]) => (
+                    <div key={label}>
+                      <label style={{ display: "block", fontSize: 8, fontWeight: 700, color: "#475569", marginBottom: 2, textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</label>
+                      <input
+                        type="number" step="any" placeholder={ph}
+                        value={val !== null ? val : ""}
+                        onChange={(e) => { const v = parseFloat(e.target.value); setter(isNaN(v) ? null : v); }}
+                        style={{ width: "100%", padding: "5px 8px", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 3, color: "#e2e8f0", fontSize: 12, fontFamily: "'JetBrains Mono', monospace", outline: "none", boxSizing: "border-box" }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, padding: 14, marginBottom: 14 }}>
               <span style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#475569" }}>Probability Model</span>
               <div style={{ marginTop: 10 }}>
@@ -674,18 +725,97 @@ function DCAEngine() {
       )}
 
       {/* ══════════ LEDGER TAB ══════════ */}
-      {tab === "ledger" && (
+      {tab === "ledger" && (() => {
+        // Sort purchases by date for cumulative calculations
+        const sorted = [...purchases].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+        // Compute cumulative columns
+        let cumBTC = PRE_LEDGER_BTC, cumSpent = 0, cumFees = 0;
+        const rows = sorted.map(p => {
+          cumBTC += p.btc;
+          cumSpent += p.cb;
+          cumFees += p.fee;
+          const cumTotal = cumSpent + cumFees;
+          const cumBasis = cumBTC > 0 ? cumTotal / cumBTC : 0;
+          return { ...p, cumBTC, cumSpent, cumFees, cumTotal, cumBasis };
+        });
+        // Latest cumulative basis for summary card
+        const latestCumBasis = rows.length > 0 ? rows[rows.length - 1].cumBasis : 0;
+
+        // Excel export
+        const exportXLSX = () => {
+          const header = ["Date", "Cuck Bucks Spent", "Fees Paid", "Total Cost", "BTC Bought", "Price Per BTC", "Cum. BTC", "Cum. Spent", "Cum. Fees", "Cum. Total Cost", "Cum. Avg Basis"];
+          const data = rows.map(r => [
+            r.date,
+            Math.round(r.cb * 100) / 100,
+            Math.round(r.fee * 100) / 100,
+            Math.round((r.cb + r.fee) * 100) / 100,
+            r.btc,
+            r.btc > 0 ? Math.round(r.cb / r.btc) : 0,
+            r.cumBTC,
+            Math.round(r.cumSpent * 100) / 100,
+            Math.round(r.cumFees * 100) / 100,
+            Math.round(r.cumTotal * 100) / 100,
+            Math.round(r.cumBasis),
+          ]);
+          // Add pre-ledger row at top
+          data.unshift(["(Pre-ledger)", 0, 0, 0, PRE_LEDGER_BTC, 0, PRE_LEDGER_BTC, 0, 0, 0, 0]);
+          // Summary rows
+          data.push([]);
+          data.push(["SUMMARY"]);
+          data.push(["Total BTC (incl. pre-ledger)", totalBTC]);
+          data.push(["Total Spent", Math.round(portfolio.spent * 100) / 100]);
+          data.push(["Total Fees", Math.round(portfolio.fees * 100) / 100]);
+          data.push(["Cumulative Cost Basis", Math.round(latestCumBasis)]);
+          data.push(["Current Value", Math.round(portfolio.value)]);
+          data.push(["P&L", Math.round(portfolio.pnl)]);
+          data.push(["Goal Progress", goalProgress + "%"]);
+
+          const ws = XLSX.utils.aoa_to_sheet([header, ...data]);
+          // Column widths
+          ws["!cols"] = [{ wch: 12 }, { wch: 16 }, { wch: 10 }, { wch: 12 }, { wch: 16 }, { wch: 14 }, { wch: 16 }, { wch: 12 }, { wch: 10 }, { wch: 14 }, { wch: 14 }];
+          const wb = XLSX.utils.book_new();
+          XLSX.utils.book_append_sheet(wb, ws, "DCA Ledger");
+          XLSX.writeFile(wb, "dca-engine-ledger-" + new Date().toISOString().slice(0, 10) + ".xlsx");
+        };
+
+        return (
         <div className="tab-content">
-          <div className="grid-6" style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8, marginBottom: 16 }}>
-            {[["Total BTC", fmtBTC(portfolio.btc)], ["Total Spent", fmt$(portfolio.spent)], ["Fees", fmt$(portfolio.fees)], ["Avg Basis", portfolio.basis > 0 ? fmt$(portfolio.basis) : "—"], ["Value", fmt$(portfolio.value)], ["P&L", fmt$(portfolio.pnl)]].map(([l, v], i) => (
+          {/* Summary cards */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 10 }} className="grid-6">
+            {[
+              ["Total BTC", fmtBTC(totalBTC), "#22c55e"],
+              ["Total Spent", fmt$(portfolio.spent), "#f7931a"],
+              ["Fees", fmt$(portfolio.fees), "#64748b"],
+              ["Cum. Avg Basis", latestCumBasis > 0 ? fmt$(latestCumBasis) : "—", "#60a5fa"],
+            ].map(([l, v, c]) => (
               <div key={l} style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 6, padding: 10 }}>
                 <div style={{ fontSize: 9, color: "#475569", textTransform: "uppercase", letterSpacing: "0.1em" }}>{l}</div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: i === 5 ? (portfolio.pnl >= 0 ? "#22c55e" : "#ef4444") : "#e2e8f0", fontFamily: "'JetBrains Mono', monospace" }}>{v}</div>
+                <div style={{ fontSize: 15, fontWeight: 800, color: c, fontFamily: "'JetBrains Mono', monospace" }}>{v}</div>
               </div>
             ))}
           </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 16 }} className="grid-6">
+            {[
+              ["Pre-Ledger BTC", fmtBTC(PRE_LEDGER_BTC), "#94a3b8"],
+              ["Current Value", fmt$(portfolio.value), "#e2e8f0"],
+              ["P&L", fmt$(portfolio.pnl), portfolio.pnl >= 0 ? "#22c55e" : "#ef4444"],
+              ["Goal", goalProgress + "% of 1 BTC", parseFloat(goalProgress) >= 100 ? "#22c55e" : "#f7931a"],
+            ].map(([l, v, c]) => (
+              <div key={l} style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 6, padding: 10 }}>
+                <div style={{ fontSize: 9, color: "#475569", textTransform: "uppercase", letterSpacing: "0.1em" }}>{l}</div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: c, fontFamily: "'JetBrains Mono', monospace" }}>{v}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Log purchase form */}
           <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, padding: 14, marginBottom: 14 }}>
-            <span style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#475569", display: "block", marginBottom: 10 }}>Log Purchase</span>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <span style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#475569" }}>Log Purchase</span>
+              <button onClick={exportXLSX} style={{ padding: "5px 12px", background: "#16a34a15", border: "1px solid #16a34a44", color: "#22c55e", borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: "pointer", letterSpacing: "0.04em" }}>
+                📥 EXPORT XLSX
+              </button>
+            </div>
             <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
               <div style={{ flex: "1 1 100px" }}><label style={lblStyle}>Date</label><input type="date" value={newP.date} onChange={e => setNewP(p=>({...p,date:e.target.value}))} style={inputStyle} /></div>
               <div style={{ flex: "1 1 80px" }}><label style={lblStyle}>Cuck Bucks</label><input type="number" value={newP.cb} onChange={e => setNewP(p=>({...p,cb:e.target.value}))} style={inputStyle} placeholder="350" /></div>
@@ -694,31 +824,53 @@ function DCAEngine() {
               <button onClick={addPurchase} style={{ padding: "8px 16px", background: "#f7931a", color: "#080c14", border: "none", borderRadius: 4, fontWeight: 800, fontSize: 11, cursor: "pointer", whiteSpace: "nowrap" }}>+ LOG</button>
             </div>
           </div>
+
+          {/* Transaction table with cumulative columns */}
           <div style={{ background: "#0c1220", border: "1px solid #1e293b", borderRadius: 8, overflow: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 500 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 800 }}>
               <thead><tr style={{ background: "#1e293b" }}>
-                {["Date", "Cuck Bucks", "BTC", "Fee", "$/BTC", ""].map(h => (
-                  <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#475569" }}>{h}</th>
+                {["Date", "Cuck Bucks", "Fee", "BTC", "$/BTC", "Cum. BTC", "Cum. Spent", "Cum. Basis", ""].map(h => (
+                  <th key={h} style={{ padding: "8px 8px", textAlign: h === "Date" ? "left" : "right", fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#475569", whiteSpace: "nowrap" }}>{h}</th>
                 ))}
               </tr></thead>
               <tbody>
-                {purchases.length === 0 ? (
-                  <tr><td colSpan={6} style={{ padding: 24, textAlign: "center", color: "#334155" }}>No purchases logged.</td></tr>
-                ) : purchases.map(p => (
-                  <tr key={p.id} style={{ borderBottom: "1px solid #1e293b" }}>
-                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#94a3b8" }}>{p.date}</td>
-                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#f7931a" }}>{fmt$(p.cb)}</td>
-                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#e2e8f0", fontWeight: 700 }}>{fmtBTC(p.btc)}</td>
-                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#64748b" }}>{fmt$(p.fee)}</td>
-                    <td style={{ padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", color: "#94a3b8" }}>{p.btc > 0 ? fmt$(p.cb / p.btc) : "—"}</td>
-                    <td style={{ padding: "8px 10px" }}><button onClick={() => setPurchases(prev => prev.filter(x => x.id !== p.id))} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 13 }}>✕</button></td>
+                {/* Pre-ledger row */}
+                <tr style={{ borderBottom: "1px solid #1e293b", background: "#0f172a" }}>
+                  <td style={{ padding: "7px 8px", fontFamily: "'JetBrains Mono', monospace", color: "#475569", fontStyle: "italic" }}>Pre-ledger</td>
+                  <td style={{ padding: "7px 8px", textAlign: "right", color: "#475569" }}>—</td>
+                  <td style={{ padding: "7px 8px", textAlign: "right", color: "#475569" }}>—</td>
+                  <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#94a3b8" }}>{fmtBTC(PRE_LEDGER_BTC)}</td>
+                  <td style={{ padding: "7px 8px", textAlign: "right", color: "#475569" }}>—</td>
+                  <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#22c55e", fontWeight: 700 }}>{fmtBTC(PRE_LEDGER_BTC)}</td>
+                  <td style={{ padding: "7px 8px", textAlign: "right", color: "#475569" }}>—</td>
+                  <td style={{ padding: "7px 8px", textAlign: "right", color: "#475569" }}>—</td>
+                  <td style={{ padding: "7px 8px" }}></td>
+                </tr>
+                {rows.length === 0 ? (
+                  <tr><td colSpan={9} style={{ padding: 24, textAlign: "center", color: "#334155" }}>No purchases logged.</td></tr>
+                ) : rows.map((r, i) => (
+                  <tr key={r.id || i} style={{ borderBottom: "1px solid #1e293b" }}>
+                    <td style={{ padding: "7px 8px", fontFamily: "'JetBrains Mono', monospace", color: "#94a3b8" }}>{r.date}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#f7931a" }}>{fmt$(r.cb)}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#64748b" }}>{fmt$(r.fee)}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: r.btc < 0 ? "#ef4444" : "#e2e8f0", fontWeight: 700 }}>{r.btc < 0 ? r.btc.toFixed(8) : "+" + r.btc.toFixed(8)}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#94a3b8" }}>{r.btc > 0 ? fmt$(r.cb / r.btc) : "—"}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#22c55e", fontWeight: 700 }}>{fmtBTC(r.cumBTC)}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#f59e0b" }}>{fmt$(r.cumTotal)}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#60a5fa", fontWeight: 700 }}>{fmt$(r.cumBasis)}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "center" }}><button onClick={() => setPurchases(prev => prev.filter(x => x.id !== r.id))} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 12, lineHeight: 1 }}>✕</button></td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+          <div style={{ marginTop: 10, fontSize: 9, color: "#334155", display: "flex", justifyContent: "space-between" }}>
+            <span>Persisted in localStorage — survives app restarts</span>
+            <span>{purchases.length} transaction{purchases.length !== 1 ? "s" : ""} logged</span>
+          </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* ══════════ PARAMS TAB ══════════ */}
       {tab === "params" && (
